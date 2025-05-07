@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
-.env/
+.env
 build/
 develop-eggs/
 dist/
@@ -19,7 +19,6 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
-.env
 
 # AWS credentials
 .aws/
