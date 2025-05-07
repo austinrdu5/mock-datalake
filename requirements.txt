@@ -1,0 +1,5 @@
+boto3==1.24.0
+python-dotenv==0.20.0
+requests
+ratelimit==2.2.1
+tenacity==8.2.3
