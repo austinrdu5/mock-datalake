@@ -19,6 +19,7 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+.env
 
 # AWS credentials
 .aws/
@@ -41,4 +42,4 @@ ENV/
 *.swo
 
 # Mac OS
-.DS_Store" > .gitignore
+.DS_Store
