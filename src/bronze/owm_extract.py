@@ -28,9 +28,8 @@ load_dotenv()
 
 # API Configuration
 API_KEY = os.getenv('OPENWEATHERMAP_API_KEY')
-BASE_URL = "https://api.openweathermap.org/data/2.5"
-HISTORY_URL = "https://history.openweathermap.org/data/3.0/history/timemachine"
-
+BASIC_URL = "https://api.openweathermap.org/data/2.5/weather"
+HISTORY_URL = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
 # AWS Configuration
 AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
 AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
@@ -62,7 +61,7 @@ def get_lat_lon(city: str) -> Tuple[float, float]:
         'appid': API_KEY
     }
     
-    response = requests.get(f"{BASE_URL}/weather", params=params)
+    response = requests.get(BASIC_URL, params=params)
     response.raise_for_status()
     data = response.json()
     
