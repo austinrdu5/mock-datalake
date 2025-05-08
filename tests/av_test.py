@@ -1,11 +1,19 @@
 import os
 import pytest
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+import boto3
+from moto import mock_s3
+import responses
+from unittest.mock import MagicMock, patch
 from src.bronze.av_extract import (
     fetch_time_series_data,
     ALPHA_VANTAGE_API_KEY,
-    BASE_URL
+    BASE_URL,
+    check_data_exists_in_s3,
+    S3_BUCKET_NAME,
+    S3_PREFIX,
+    save_to_s3
 )
 
 # Set up test environment
@@ -91,6 +99,101 @@ def test_fetch_time_series_data_invalid_symbol():
     """Test API response for invalid symbol"""
     data = fetch_time_series_data('INVALID_SYMBOL_123')
     assert data is None, "Should return None for invalid symbol"
+
+def test_check_data_exists_in_s3():
+    """Test S3 data existence check functionality"""
+    # Create mock S3 client
+    mock_s3_client = MagicMock()
+    
+    # Test case 1: No data exists
+    mock_s3_client.list_objects_v2.return_value = {}
+    assert not check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return False when no data exists"
+    
+    # Test case 2: Data exists but is old
+    old_timestamp = datetime.now() - timedelta(days=2)
+    mock_s3_client.list_objects_v2.return_value = {
+        'Contents': [{'Key': 'old_data.csv', 'LastModified': old_timestamp}]
+    }
+    assert not check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return False for old data"
+    
+    # Test case 3: Recent data exists
+    recent_timestamp = datetime.now() - timedelta(hours=12)
+    mock_s3_client.list_objects_v2.return_value = {
+        'Contents': [{'Key': 'recent_data.csv', 'LastModified': recent_timestamp}]
+    }
+    assert check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return True for recent data"
+
+@mock_s3
+@responses.activate
+@patch('src.bronze.av_extract.save_to_s3')
+def test_process_symbol_with_existing_data(mock_save_to_s3):
+    """Test process_symbol behavior with existing data"""
+    from src.bronze.av_extract import process_symbol
+    
+    # Create mock S3 client
+    mock_s3_client = MagicMock()
+    recent_timestamp = datetime.now() - timedelta(hours=12)
+    mock_s3_client.list_objects_v2.return_value = {
+        'Contents': [{'Key': 'recent_data.csv', 'LastModified': recent_timestamp}]
+    }
+    
+    # Mock Alpha Vantage API response for force refresh
+    mock_csv_data = "timestamp,open,high,low,close,volume\n2024-01-01,100.0,101.0,99.0,100.5,1000"
+    responses.add(
+        responses.GET,
+        BASE_URL,
+        body=mock_csv_data,
+        status=200,
+        content_type='text/csv'
+    )
+    
+    # Mock save_to_s3 to return True
+    mock_save_to_s3.return_value = True
+    
+    # Test normal processing (should skip API call)
+    assert process_symbol('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return True when data exists"
+    assert not mock_save_to_s3.called, "save_to_s3 should not be called when data exists"
+    
+    # Test force refresh
+    assert process_symbol('TEST', 'TIME_SERIES_DAILY', force_refresh=True, s3_client_override=mock_s3_client), "Should return True with force refresh"
+    assert mock_save_to_s3.called, "save_to_s3 should be called with force refresh"
+
+@pytest.mark.integration
+def test_real_s3_integration():
+    """Integration test using real S3 bucket and Alpha Vantage demo key"""
+    # Set up demo API key
+    os.environ['ALPHA_VANTAGE_API_KEY'] = 'demo'
+    
+    # Fetch IBM data using demo key
+    data = fetch_time_series_data('IBM', outputsize='compact')
+    assert data is not None, "Failed to fetch IBM data with demo key"
+    assert 'csv_data' in data, "Response should contain csv_data"
+    
+    # Save to S3
+    assert save_to_s3(data, 'IBM', 'TIME_SERIES_DAILY'), "Failed to save data to S3"
+    
+    # Check if data exists in S3
+    assert check_data_exists_in_s3('IBM', 'TIME_SERIES_DAILY'), "Data should exist in S3"
+    
+    # Check with force refresh
+    assert check_data_exists_in_s3('IBM', 'TIME_SERIES_DAILY', days_threshold=0), "Data should be considered old with 0 day threshold"
+    
+    # Clean up - delete the test file
+    s3_client = boto3.client('s3')
+    try:
+        # List objects to find the file we just created
+        response = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET_NAME,
+            Prefix=f"{S3_PREFIX}/IBM/"
+        )
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                s3_client.delete_object(
+                    Bucket=S3_BUCKET_NAME,
+                    Key=obj['Key']
+                )
+    except Exception as e:
+        print(f"Warning: Failed to clean up S3: {str(e)}")
 
 if __name__ == '__main__':
     pytest.main([__file__])

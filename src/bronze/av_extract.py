@@ -4,7 +4,7 @@ import json
 import logging
 import time
 import boto3
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import random
 from typing import Dict, List, Optional, Union, Any
@@ -17,13 +17,6 @@ logging.basicConfig(
     force=True  # This ensures we can reconfigure logging
 )
 logger = logging.getLogger(__name__)
-
-# Add console handler to see logs during testing
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
 
 # Alpha Vantage API configuration
 ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY')
@@ -169,8 +162,61 @@ def save_to_s3(data: Dict[str, Any], symbol: str, function: str, batch_id: Optio
         logger.error(f"Failed to save to S3: {str(e)}")
         return False
     
-def process_symbol(symbol: str, function: str, batch_id: Optional[str] = None) -> bool:
-    """Process a single symbol"""
+def check_data_exists_in_s3(symbol: str, function: str, days_threshold: int = 1, s3_client_override: Optional[boto3.client] = None) -> bool:
+    """
+    Check if data for a symbol exists in S3 and is recent enough
+    
+    Args:
+        symbol (str): Stock symbol
+        function (str): Alpha Vantage function used
+        days_threshold (int): Number of days to consider data fresh
+        s3_client_override (Optional[boto3.client]): Optional S3 client for testing
+        
+    Returns:
+        bool: True if recent data exists, False otherwise
+    """
+    try:
+        client = s3_client_override or s3_client
+        # List objects in the symbol's directory
+        prefix = f"{S3_PREFIX}/{symbol}/"
+        response = client.list_objects_v2(
+            Bucket=S3_BUCKET_NAME,
+            Prefix=prefix
+        )
+        
+        if 'Contents' not in response:
+            return False
+            
+        # Get the most recent file
+        latest_file = max(response['Contents'], key=lambda x: x['LastModified'])
+        
+        # Check if the file is recent enough
+        time_threshold = datetime.now(latest_file['LastModified'].tzinfo) - timedelta(days=days_threshold)
+        return latest_file['LastModified'] > time_threshold
+        
+    except Exception as e:
+        logger.error(f"Error checking S3 for existing data: {str(e)}")
+        return False
+
+def process_symbol(symbol: str, function: str, batch_id: Optional[str] = None, force_refresh: bool = False, s3_client_override: Optional[boto3.client] = None) -> bool:
+    """
+    Process a single symbol
+    
+    Args:
+        symbol (str): Stock symbol
+        function (str): Alpha Vantage function to use
+        batch_id (Optional[str]): Optional batch identifier
+        force_refresh (bool): Force refresh data even if it exists in S3
+        s3_client_override (Optional[boto3.client]): Optional S3 client for testing
+        
+    Returns:
+        bool: Success status
+    """
+    # Check if data exists and is recent enough
+    if not force_refresh and check_data_exists_in_s3(symbol, function, s3_client_override=s3_client_override):
+        logger.info(f"Recent data for {symbol} already exists in S3, skipping API call")
+        return True
+        
     data = fetch_time_series_data(symbol, function)
     if data:
         return save_to_s3(data, symbol, function, batch_id)
@@ -179,29 +225,31 @@ def process_symbol(symbol: str, function: str, batch_id: Optional[str] = None) -
 def batch_process(
     symbols: List[str] = STOCK_SYMBOLS,
     functions: Optional[List[str]] = None,
-    concurrent: bool = False
+    concurrent: bool = False,
+    force_refresh: bool = False
 ) -> int:
     """
     Batch process multiple symbols with rate limiting
     
     Args:
         symbols (List[str]): List of stock symbols to process
-        functions (Optional[List[str]]): List of Alpha Vantage functions to use
+        functions (Optional[List[str]]): List of Alpha Vantage functions to use. Defaults to ['TIME_SERIES_DAILY']
         concurrent (bool): Whether to use concurrent processing
+        force_refresh (bool): Force refresh data even if it exists in S3
         
     Returns:
         int: Number of successful operations
     """
     if functions is None:
-        functions = ['TIME_SERIES_DAILY', 'OVERVIEW', 'GLOBAL_QUOTE']
+        functions = ['TIME_SERIES_DAILY']  # Default to just daily time series data
     
     batch_id = datetime.now().strftime('%Y%m%d%H%M%S')
     logger.info(f"Starting batch process {batch_id} for {len(symbols)} symbols")
     
     success_count = 0
     
-    # Generate all combinations of symbols and functions
-    tasks = [(symbol, function) for symbol in symbols for function in functions]
+    # Process each symbol once with the first function
+    tasks = [(symbol, functions[0]) for symbol in symbols]
     
     if concurrent:
         # Concurrent processing with rate limiting
@@ -214,7 +262,7 @@ def batch_process(
                     time.sleep(sleep_time)
                 
                 # Submit task to thread pool
-                future = executor.submit(process_symbol, symbol, function, batch_id)
+                future = executor.submit(process_symbol, symbol, function, batch_id, force_refresh)
                 if future.result():
                     success_count += 1
     else:
@@ -226,7 +274,7 @@ def batch_process(
                 logger.info(f"Rate limiting: sleeping for {sleep_time} seconds")
                 time.sleep(sleep_time)
             
-            if process_symbol(symbol, function, batch_id):
+            if process_symbol(symbol, function, batch_id, force_refresh):
                 success_count += 1
     
     logger.info(f"Batch {batch_id} completed: {success_count}/{len(tasks)} successful")
@@ -243,10 +291,12 @@ if __name__ == "__main__":
                         help='Alpha Vantage functions to use')
     parser.add_argument('--concurrent', action='store_true', 
                         help='Use concurrent processing')
+    parser.add_argument('--force-refresh', action='store_true',
+                        help='Force refresh data even if it exists in S3')
     
     args = parser.parse_args()
     
     logger.info("Starting Alpha Vantage extraction process")
-    success_count = batch_process(args.symbols, args.functions, args.concurrent)
+    success_count = batch_process(args.symbols, args.functions, args.concurrent, args.force_refresh)
     
     logger.info(f"Extraction complete: {success_count} successful API calls")

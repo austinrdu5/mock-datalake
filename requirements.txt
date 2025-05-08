@@ -3,3 +3,4 @@ python-dotenv==0.20.0
 requests
 ratelimit==2.2.1
 tenacity==8.2.3
+moto==4.2.13  # For mocking AWS services in tests
