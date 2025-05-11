@@ -120,6 +120,7 @@ def fetch_historical_weather(lat: float, lon: float, dt: int) -> Dict[str, Any]:
     Raises:
         Exception: If API call fails
     """
+    logger.info(f"Making API call for coordinates ({lat}, {lon}) at timestamp {dt}")
     params = {
         'lat': lat,
         'lon': lon,
@@ -130,6 +131,7 @@ def fetch_historical_weather(lat: float, lon: float, dt: int) -> Dict[str, Any]:
     
     response = requests.get(HISTORY_URL, params=params)
     response.raise_for_status()
+    logger.info(f"Successfully received API response for timestamp {dt}")
     return response.json()
 
 def fetch_with_retry(lat: float, lon: float, dt: int, city: str) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -244,7 +246,10 @@ def get_existing_s3_paths(cities: List[str], dates: List[datetime.datetime]) -> 
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
             if 'Contents' in page:
                 for obj in page['Contents']:
-                    existing_paths.add(obj['Key'])
+                    # Normalize the path by replacing spaces with underscores
+                    normalized_key = obj['Key'].replace(' ', '_')
+                    existing_paths.add(normalized_key)
+        logger.info(f"Found {len(existing_paths)} existing files in S3")
     except Exception as e:
         logger.warning(f"Error listing S3 objects: {str(e)}")
         # Return empty set on error
@@ -293,15 +298,53 @@ def extract_historical_weather_for_cities(
     
     # Process each city and date combination
     for city in city_list:
+        # Normalize city name for path checking
+        normalized_city = city.lower().replace(' ', '_')
+        
         # Check if we need to fetch coordinates
         need_coords = False
+        dates_to_fetch = []
         for date in dates:
-            # Set time to 9:00 AM local time
-            local_time = datetime.datetime.combine(date.date(), datetime.time(9, 0))
-            s3_key = f"bronze/openweathermap/city={city.lower()}/{local_time.strftime('%Y-%m-%d_%H-%M')}.json"
-            if s3_key not in existing_paths:
-                need_coords = True
-                break
+            # First get the timezone for this city
+            try:
+                # Get current weather to get timezone info
+                params = {
+                    'q': city,
+                    'appid': API_KEY
+                }
+                response = requests.get(BASIC_URL, params=params)
+                response.raise_for_status()
+                timezone_data = response.json()
+                
+                # Get timezone offset in seconds
+                timezone_offset = timezone_data.get('timezone', 0)
+                
+                # Create local time (9:00 AM) in the city's timezone
+                local_time = datetime.datetime.combine(date.date(), datetime.time(9, 0))
+                local_tz = datetime.timezone(datetime.timedelta(seconds=timezone_offset))
+                local_time = local_time.replace(tzinfo=local_tz)
+                
+                # Convert to UTC timestamp for API
+                utc_time = local_time.astimezone(datetime.timezone.utc)
+                dt = int(utc_time.timestamp())
+                
+                # Use UTC time for S3 key with normalized city name
+                s3_key = f"bronze/openweathermap/city={normalized_city}/{utc_time.strftime('%Y-%m-%d_%H-%M')}UTC.json"
+                
+                if s3_key not in existing_paths:
+                    need_coords = True
+                    dates_to_fetch.append((date, dt, s3_key))
+                    logger.info(f"Need to fetch data for {city} on {date.date()} - file {s3_key} not found in S3")
+                else:
+                    logger.info(f"Skipping {city} on {date.date()} - file {s3_key} already exists in S3")
+            except Exception as e:
+                logger.error(f"Failed to get timezone for {city}: {str(e)}")
+                failures.append({
+                    'city': city,
+                    'date': date,
+                    'error': f"Timezone error: {str(e)}"
+                })
+                continue
         
         if not need_coords:
             logger.info(f"All data exists in S3 for {city}, skipping API calls")
@@ -321,48 +364,9 @@ def extract_historical_weather_for_cities(
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_to_params = {}
             
-            for date in dates:
-                # First get the timezone for this city
-                try:
-                    # Get current weather to get timezone info
-                    params = {
-                        'lat': lat,
-                        'lon': lon,
-                        'appid': API_KEY
-                    }
-                    response = requests.get(BASIC_URL, params=params)
-                    response.raise_for_status()
-                    timezone_data = response.json()
-                    
-                    # Get timezone offset in seconds
-                    timezone_offset = timezone_data.get('timezone', 0)
-                    
-                    # Create local time (9:00 AM) in the city's timezone
-                    local_time = datetime.datetime.combine(date.date(), datetime.time(9, 0))
-                    local_tz = datetime.timezone(datetime.timedelta(seconds=timezone_offset))
-                    local_time = local_time.replace(tzinfo=local_tz)
-                    
-                    # Convert to UTC timestamp for API
-                    utc_time = local_time.astimezone(datetime.timezone.utc)
-                    dt = int(utc_time.timestamp())
-                    
-                    s3_key = f"bronze/openweathermap/city={city.lower()}/{local_time.strftime('%Y-%m-%d_%H-%M')}.json"
-                    
-                    # Check if data already exists in S3
-                    if s3_key in existing_paths:
-                        logger.info(f"Data already exists in S3 for {city} on {date.date()}, skipping API call")
-                        continue
-                        
-                    future = executor.submit(fetch_with_retry, lat, lon, dt, city)
-                    future_to_params[future] = (city, dt)
-                except Exception as e:
-                    logger.error(f"Failed to get timezone for {city}: {str(e)}")
-                    failures.append({
-                        'city': city,
-                        'date': date,
-                        'error': f"Timezone error: {str(e)}"
-                    })
-                    continue
+            for date, dt, s3_key in dates_to_fetch:
+                future = executor.submit(fetch_with_retry, lat, lon, dt, city)
+                future_to_params[future] = (city, dt)
             
             for future in concurrent.futures.as_completed(future_to_params):
                 city, dt = future_to_params[future]
@@ -428,11 +432,14 @@ def save_to_s3(data: List[Dict[str, Any]], batch_id: Optional[str] = None) -> bo
     try:
         # Group data by city and date
         for item in data:
-            city = item['_metadata']['city'].lower()
-            dt = datetime.datetime.fromtimestamp(item['dt'])
+            # Normalize city name: lowercase and replace spaces with underscores
+            city = item['_metadata']['city'].lower().replace(' ', '_')
             
-            # Create S3 path with new format using full timestamp
-            s3_key = f"bronze/openweathermap/city={city}/{dt.strftime('%Y-%m-%d_%H-%M')}.json"
+            # Convert timestamp to UTC datetime
+            dt = datetime.datetime.fromtimestamp(item['dt'], tz=datetime.timezone.utc)
+            
+            # Create S3 path with new format using UTC timestamp
+            s3_key = f"bronze/openweathermap/city={city}/{dt.strftime('%Y-%m-%d_%H-%M')}UTC.json"
             
             # Convert single item to JSON
             json_data = json.dumps(item)

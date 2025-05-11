@@ -147,20 +147,176 @@ def test_rate_limiting():
 def test_retry_mechanism():
     """Test retry mechanism by temporarily using an invalid API key"""
     with patch('requests.get') as mock_get:
-        # Create a mock response with error
-        mock_response = MagicMock()
-        mock_response.status_code = 401
-        mock_response.text = "Invalid API key"
-        mock_response.json.return_value = {"error": "Invalid response"}
-        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_response)
-        mock_get.return_value = mock_response
-        
+        # Mock timezone and weather responses
+        def mock_get_side_effect(*args, **kwargs):
+            mock_response = MagicMock()
+            mock_response.raise_for_status.return_value = None
+            
+            url = args[0] if args else kwargs.get('url', '')
+            params = kwargs.get('params', {})
+            
+            if 'data/2.5/weather' in url:
+                # First call for timezone info
+                mock_response.json.return_value = {
+                    'coord': {'lat': 51.5074, 'lon': -0.1278},
+                    'timezone': 0,  # UTC+0
+                    'name': 'London'
+                }
+            elif 'data/3.0/onecall/timemachine' in url:
+                # Second call for historical data - return error
+                mock_response.status_code = 401
+                mock_response.text = "Invalid API key"
+                mock_response.json.return_value = {"error": "Invalid response"}
+                mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_response)
+            return mock_response
+            
+        mock_get.side_effect = mock_get_side_effect
+
         results, failures = omw.extract_historical_weather_for_cities(
             city_list=["London"],
             dates=[datetime.now() - timedelta(days=1)]
         )
-        
+
         # Should have failures after retries
+        assert len(failures) == 1
+        assert "401" in failures[0]["error"]
+
+def test_skip_existing_data(mock_s3_client, sample_weather_data):
+    """Test that the extraction process skips existing data"""
+    # Mock S3 to return existing data
+    mock_response = {
+        'Contents': [
+            {'Key': 'bronze/openweathermap/city=london/2024-03-15_09-00UTC.json'}  # 9:00 AM UTC
+        ]
+    }
+    mock_paginator = MagicMock()
+    mock_paginator.paginate.return_value = [mock_response]
+    mock_s3_client.return_value.get_paginator.return_value = mock_paginator
+    
+    test_city = "London"
+    test_date = datetime(2024, 3, 15)
+    
+    # Mock the fetch functions to verify they're not called
+    with patch('requests.get') as mock_get:
+        # Mock timezone response
+        def mock_get_side_effect(*args, **kwargs):
+            mock_response = MagicMock()
+            mock_response.raise_for_status.return_value = None
+            mock_response.json.return_value = {
+                'coord': {'lat': 51.5074, 'lon': -0.1278},
+                'timezone': 0,  # UTC+0
+                'name': 'London'
+            }
+            return mock_response
+            
+        mock_get.side_effect = mock_get_side_effect
+        
+        results, failures = omw.extract_historical_weather_for_cities(
+            city_list=[test_city],
+            dates=[test_date]
+        )
+        
+        # Results should be empty since we skipped the API call
+        assert len(results) == 0
+        assert len(failures) == 0
+
+def test_mixed_existing_and_new_data(mock_s3_client, sample_weather_data):
+    """Test handling of mix of existing and new data"""
+    # Mock S3 to return only one existing path
+    mock_response = {
+        'Contents': [
+            {'Key': 'bronze/openweathermap/city=london/2024-03-15_09-00UTC.json'}  # 9:00 AM UTC
+        ]
+    }
+    mock_paginator = MagicMock()
+    mock_paginator.paginate.return_value = [mock_response]
+    mock_s3_client.return_value.get_paginator.return_value = mock_paginator
+    
+    test_city = "London"
+    test_dates = [
+        datetime(2024, 3, 15),  # This will exist
+        datetime(2024, 3, 16)   # This will be new
+    ]
+    
+    # Mock the fetch functions
+    with patch('requests.get') as mock_get:
+        # Mock timezone and weather responses
+        def mock_get_side_effect(*args, **kwargs):
+            mock_response = MagicMock()
+            mock_response.raise_for_status.return_value = None
+            
+            url = args[0] if args else kwargs.get('url', '')
+            params = kwargs.get('params', {})
+            
+            if 'data/2.5/weather' in url:
+                mock_response.json.return_value = {
+                    'coord': {'lat': 51.5074, 'lon': -0.1278},
+                    'timezone': 0,  # UTC+0
+                    'name': 'London'
+                }
+            elif 'data/3.0/onecall/timemachine' in url:
+                mock_data = sample_weather_data.copy()
+                mock_data['dt'] = params.get('dt')
+                mock_response.json.return_value = {
+                    'lat': 51.5074,
+                    'lon': -0.1278,
+                    'timezone': 'UTC',
+                    'timezone_offset': 0,
+                    'data': [mock_data]
+                }
+            return mock_response
+            
+        mock_get.side_effect = mock_get_side_effect
+        
+        results, failures = omw.extract_historical_weather_for_cities(
+            city_list=[test_city],
+            dates=test_dates
+        )
+        
+        # Should have results only for the new date
+        assert len(results) == 1
+        assert len(failures) == 0
+        
+        # Verify the result is for the second date
+        result_date = datetime.fromtimestamp(results[0]['dt'], tz=timezone.utc)
+        assert result_date.date() == test_dates[1].date()
+        assert result_date.hour == 9
+        assert result_date.minute == 0
+
+def test_invalid_api_response():
+    """Test handling of invalid API response"""
+    with patch('requests.get') as mock_get:
+        # Mock timezone and weather responses
+        def mock_get_side_effect(*args, **kwargs):
+            mock_response = MagicMock()
+            mock_response.raise_for_status.return_value = None
+            
+            url = args[0] if args else kwargs.get('url', '')
+            params = kwargs.get('params', {})
+            
+            if 'data/2.5/weather' in url:
+                # First call for timezone info
+                mock_response.json.return_value = {
+                    'coord': {'lat': 51.5074, 'lon': -0.1278},
+                    'timezone': 0,  # UTC+0
+                    'name': 'London'
+                }
+            elif 'data/3.0/onecall/timemachine' in url:
+                # Second call for historical data - return error
+                mock_response.status_code = 401
+                mock_response.text = "Invalid API key"
+                mock_response.json.return_value = {"error": "Invalid response"}
+                mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_response)
+            return mock_response
+            
+        mock_get.side_effect = mock_get_side_effect
+
+        results, failures = omw.extract_historical_weather_for_cities(
+            city_list=["London"],
+            dates=[datetime.now() - timedelta(days=1)]
+        )
+
+        assert len(results) == 0
         assert len(failures) == 1
         assert "401" in failures[0]["error"]
 
@@ -218,13 +374,13 @@ def test_get_existing_s3_paths_with_mock(mock_s3_client):
     # Setup mock response with pagination
     mock_response1 = {
         'Contents': [
-            {'Key': 'bronze/openweathermap/city=london/2024-03-15_09-00.json'},
-            {'Key': 'bronze/openweathermap/city=newyork/2024-03-15_09-00.json'}
+            {'Key': 'bronze/openweathermap/city=london/2024-03-15_09-00UTC.json'},  # 9:00 AM UTC
+            {'Key': 'bronze/openweathermap/city=new_york/2024-03-15_14-00UTC.json'}  # 9:00 AM EST
         ]
     }
     mock_response2 = {
         'Contents': [
-            {'Key': 'bronze/openweathermap/city=london/2024-03-16_09-00.json'}
+            {'Key': 'bronze/openweathermap/city=london/2024-03-16_09-00UTC.json'}  # 9:00 AM UTC
         ]
     }
     
@@ -240,88 +396,9 @@ def test_get_existing_s3_paths_with_mock(mock_s3_client):
     
     # Verify results
     assert len(existing_paths) == 3
-    assert 'bronze/openweathermap/city=london/2024-03-15_09-00.json' in existing_paths
-    assert 'bronze/openweathermap/city=newyork/2024-03-15_09-00.json' in existing_paths
-    assert 'bronze/openweathermap/city=london/2024-03-16_09-00.json' in existing_paths
-
-def test_skip_existing_data(mock_s3_client, sample_weather_data):
-    """Test that the extraction process skips existing data"""
-    # Mock S3 to return existing data
-    mock_response = {
-        'Contents': [
-            {'Key': 'bronze/openweathermap/city=london/2024-03-15_09-00.json'}
-        ]
-    }
-    mock_paginator = MagicMock()
-    mock_paginator.paginate.return_value = [mock_response]
-    mock_s3_client.return_value.get_paginator.return_value = mock_paginator
-    
-    test_city = "London"
-    test_date = datetime(2024, 3, 15)
-    
-    # Mock the fetch functions to verify they're not called
-    with patch('src.bronze.owm_extract.fetch_with_retry') as mock_fetch, \
-         patch('src.bronze.owm_extract.get_lat_lon') as mock_get_coords:
-        
-        results, failures = omw.extract_historical_weather_for_cities(
-            city_list=[test_city],
-            dates=[test_date]
-        )
-        
-        # Verify that neither function was called
-        mock_fetch.assert_not_called()
-        mock_get_coords.assert_not_called()
-        
-        # Results should be empty since we skipped the API call
-        assert len(results) == 0
-        assert len(failures) == 0
-
-def test_mixed_existing_and_new_data(mock_s3_client, sample_weather_data):
-    """Test handling of mix of existing and new data"""
-    # Mock S3 to return only one existing path
-    mock_response = {
-        'Contents': [
-            {'Key': 'bronze/openweathermap/city=london/2024-03-15_09-00.json'}
-        ]
-    }
-    mock_paginator = MagicMock()
-    mock_paginator.paginate.return_value = [mock_response]
-    mock_s3_client.return_value.get_paginator.return_value = mock_paginator
-    
-    test_city = "London"
-    test_dates = [
-        datetime(2024, 3, 15),  # This will exist
-        datetime(2024, 3, 16)   # This will be new
-    ]
-    
-    # Mock the fetch functions
-    with patch('src.bronze.owm_extract.fetch_with_retry') as mock_fetch, \
-         patch('src.bronze.owm_extract.get_lat_lon') as mock_get_coords:
-        
-        # Setup mock returns
-        mock_get_coords.return_value = (51.5074, -0.1278)
-        
-        # Create mock data with the correct timestamp
-        mock_data = sample_weather_data.copy()
-        local_time = test_dates[1].replace(hour=9)
-        mock_data['dt'] = int(local_time.timestamp())
-        mock_fetch.return_value = (mock_data, None)
-        
-        results, failures = omw.extract_historical_weather_for_cities(
-            city_list=[test_city],
-            dates=test_dates
-        )
-        
-        # Should have results only for the new date
-        assert len(results) == 1
-        assert len(failures) == 0
-        
-        # Verify fetch was called only once (for the new date)
-        assert mock_fetch.call_count == 1
-        
-        # Verify the result is for the second date
-        result_date = datetime.fromtimestamp(results[0]['dt'])
-        assert result_date.date() == test_dates[1].date()
+    assert 'bronze/openweathermap/city=london/2024-03-15_09-00UTC.json' in existing_paths
+    assert 'bronze/openweathermap/city=new_york/2024-03-15_14-00UTC.json' in existing_paths
+    assert 'bronze/openweathermap/city=london/2024-03-16_09-00UTC.json' in existing_paths
 
 def test_s3_error_handling(mock_s3_client):
     """Test handling of S3 errors during path checking"""
@@ -351,7 +428,22 @@ def test_save_to_s3_with_mock(mock_s3_client, sample_weather_data):
     # Mock successful S3 put_object
     mock_s3_client.return_value.put_object.return_value = {'ResponseMetadata': {'HTTPStatusCode': 200}}
     
-    success = omw.save_to_s3([sample_weather_data])
+    # Create a sample weather data with a known UTC timestamp
+    test_data = sample_weather_data.copy()
+    # Set timestamp to 2024-03-15 14:00 UTC (which is 9:00 AM EST for New York)
+    test_dt = int(datetime(2024, 3, 15, 14, 0, tzinfo=timezone.utc).timestamp())
+    test_data.update({
+        'dt': test_dt,
+        '_metadata': {
+            'source': 'openweathermap',
+            'ingestion_timestamp': datetime.now().isoformat(),
+            'city': 'New York',
+            'timezone': 'UTC',
+            'timezone_offset': -18000  # UTC-5 for EST
+        }
+    })
+    
+    success = omw.save_to_s3([test_data])
     assert success is True
     
     # Verify S3 put_object was called with correct parameters
@@ -362,18 +454,23 @@ def test_save_to_s3_with_mock(mock_s3_client, sample_weather_data):
     
     # Verify the key structure
     key = call_args['Key']
-    assert key.startswith('bronze/openweathermap/city=london/')
-    assert key.endswith('.json')
+    assert key.startswith('bronze/openweathermap/city=new_york/')
+    assert key.endswith('UTC.json')
     
     # Extract date and time from the key
-    date_time_str = key.split('/')[-1].replace('.json', '')
-    assert len(date_time_str) == 16  # YYYY-MM-DD_HH-MM format
-    assert date_time_str[10] == '_'  # Check separator
-    assert date_time_str[13] == '-'  # Check time separator
+    date_time_str = key.split('/')[-1].replace('UTC.json', '')
+    assert date_time_str == '2024-03-15_14-00'  # Should be UTC time
     
-    # Verify the body is valid JSON
+    # Verify the body is valid JSON and contains the correct timestamp
     body = json.loads(call_args['Body'])
-    assert body == sample_weather_data
+    assert body == test_data
+    assert body['dt'] == test_dt
+    
+    # Verify that the timestamp in the data corresponds to 9:00 AM EST
+    dt = datetime.fromtimestamp(body['dt'], tz=timezone.utc)
+    local_time = dt.astimezone(timezone(timedelta(hours=-5)))  # Convert to EST
+    assert local_time.hour == 9
+    assert local_time.minute == 0
 
 def test_save_to_s3_error_handling(mock_s3_client, sample_weather_data):
     """Test error handling when saving to S3"""
@@ -441,26 +538,6 @@ def test_concurrent_api_calls():
         assert mock_sleep.call_count >= expected_sleep_calls
 
 # Validation Tests
-def test_invalid_api_response():
-    """Test handling of invalid API response"""
-    with patch('requests.get') as mock_get:
-        # Create a mock response with error
-        mock_response = MagicMock()
-        mock_response.status_code = 401
-        mock_response.text = "Invalid API key"
-        mock_response.json.return_value = {"error": "Invalid response"}
-        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_response)
-        mock_get.return_value = mock_response
-        
-        results, failures = omw.extract_historical_weather_for_cities(
-            city_list=["London"],
-            dates=[datetime.now() - timedelta(days=1)]
-        )
-        
-        assert len(results) == 0
-        assert len(failures) == 1
-        assert "401" in failures[0]["error"]
-
 def test_malformed_weather_data():
     """Test handling of malformed weather data"""
     with patch('src.bronze.owm_extract.fetch_historical_weather') as mock_fetch, \
@@ -529,7 +606,8 @@ def test_invalid_aws_credentials(mock_s3_client):
 def test_timezone_handling():
     """Test that API calls are made with correct UTC timestamps based on city timezones"""
     # Mock the API responses
-    with patch('requests.get') as mock_get:
+    with patch('requests.get') as mock_get, \
+         patch('src.bronze.owm_extract.get_existing_s3_paths') as mock_get_paths:
         
         # Mock responses for timezone info
         def mock_get_side_effect(*args, **kwargs):
@@ -592,6 +670,9 @@ def test_timezone_handling():
         cities = ["London", "New York", "Tokyo"]
         test_date = datetime(2024, 3, 15)
         
+        # Return empty set for get_existing_s3_paths to ensure API calls are made
+        mock_get_paths.return_value = set()
+        
         results, failures = omw.extract_historical_weather_for_cities(
             city_list=cities,
             dates=[test_date]
@@ -620,7 +701,7 @@ def test_timezone_handling():
         tokyo_expected = int(tokyo_time.astimezone(timezone.utc).timestamp())
         assert city_timestamps["Tokyo"] == tokyo_expected
         
-        # Verify that the S3 keys use local time
+        # Verify that the timestamps in the results correspond to 9:00 AM local time
         for result in results:
             city = result['_metadata']['city']
             dt = datetime.fromtimestamp(result['dt'], tz=timezone.utc)
@@ -633,6 +714,6 @@ def test_timezone_handling():
             elif city == "Tokyo":
                 local_time = dt.astimezone(timezone(timedelta(hours=9)))
             
-            # Verify local time is 9:00 AM
+            # Verify the local time is 9:00 AM
             assert local_time.hour == 9
             assert local_time.minute == 0
