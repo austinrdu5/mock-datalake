@@ -27,14 +27,20 @@ BASE_URL = 'https://www.alphavantage.co/query'
 # AWS S3 configuration
 AWS_ACCESS_KEY = os.environ.get('AWS_ACCESS_KEY')
 AWS_SECRET_KEY = os.environ.get('AWS_SECRET_KEY')
-S3_BUCKET_NAME = 'mock-datalake1'  # Hardcoded bucket name
-S3_PREFIX = 'bronze/alphavantage'  # Updated prefix
+S3_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_NAME')
+S3_PREFIX = 'bronze/alphavantage'
+
+# Debug logging - show last 4 chars of keys
+logger.info(f"AWS_ACCESS_KEY ends with: ...{AWS_ACCESS_KEY[-4:] if AWS_ACCESS_KEY else 'None'}")
+logger.info(f"AWS_SECRET_KEY ends with: ...{AWS_SECRET_KEY[-4:] if AWS_SECRET_KEY else 'None'}")
+logger.info(f"S3_BUCKET_NAME: {S3_BUCKET_NAME}")
 
 # Create S3 client
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name='us-east-1'  # Added explicit region
 )
 
 # Stock symbols to fetch (you can expand this list)
