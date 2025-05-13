@@ -125,7 +125,7 @@ def fetch_time_series_data(symbol: str, function: str = 'TIME_SERIES_DAILY', out
         logger.error(f"Exception during API call: {str(e)}")
         return None
 
-def save_to_s3(data: Dict[str, Any], symbol: str, function: str, batch_id: Optional[str] = None) -> bool:
+def save_to_s3(data: Dict[str, Any], symbol: str, function: str, batch_timestamp: str) -> bool:
     """
     Save data to S3 bucket with appropriate partitioning
     
@@ -133,7 +133,7 @@ def save_to_s3(data: Dict[str, Any], symbol: str, function: str, batch_id: Optio
         data (Dict[str, Any]): Data to save (contains csv_data and metadata)
         symbol (str): Stock symbol
         function (str): Alpha Vantage function used
-        batch_id (Optional[str]): Optional batch identifier
+        batch_timestamp (str): Timestamp of the batch run
     
     Returns:
         bool: Success status
@@ -141,10 +141,8 @@ def save_to_s3(data: Dict[str, Any], symbol: str, function: str, batch_id: Optio
     if not data or 'csv_data' not in data:
         return False
         
-    # Create filename with timestamp for temporal integration
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    batch_suffix = f"_batch{batch_id}" if batch_id else ""
-    filename = f"{timestamp}{batch_suffix}.csv"
+    # Create filename using batch timestamp
+    filename = f"{batch_timestamp}.csv"
     
     # Create S3 path with new structure
     s3_key = f"{S3_PREFIX}/{symbol}/{filename}"
@@ -198,14 +196,14 @@ def check_data_exists_in_s3(symbol: str, function: str, days_threshold: int = 1,
         logger.error(f"Error checking S3 for existing data: {str(e)}")
         return False
 
-def process_symbol(symbol: str, function: str, batch_id: Optional[str] = None, force_refresh: bool = False, s3_client_override: Optional[boto3.client] = None) -> bool:
+def process_symbol(symbol: str, function: str, batch_timestamp: str, force_refresh: bool = False, s3_client_override: Optional[boto3.client] = None) -> bool:
     """
     Process a single symbol
     
     Args:
         symbol (str): Stock symbol
         function (str): Alpha Vantage function to use
-        batch_id (Optional[str]): Optional batch identifier
+        batch_timestamp (str): Timestamp of the batch run
         force_refresh (bool): Force refresh data even if it exists in S3
         s3_client_override (Optional[boto3.client]): Optional S3 client for testing
         
@@ -219,7 +217,7 @@ def process_symbol(symbol: str, function: str, batch_id: Optional[str] = None, f
         
     data = fetch_time_series_data(symbol, function)
     if data:
-        return save_to_s3(data, symbol, function, batch_id)
+        return save_to_s3(data, symbol, function, batch_timestamp)
     return False
 
 def batch_process(
@@ -243,8 +241,8 @@ def batch_process(
     if functions is None:
         functions = ['TIME_SERIES_DAILY']  # Default to just daily time series data
     
-    batch_id = datetime.now().strftime('%Y%m%d%H%M%S')
-    logger.info(f"Starting batch process {batch_id} for {len(symbols)} symbols")
+    batch_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    logger.info(f"Starting batch process at {batch_timestamp} for {len(symbols)} symbols")
     
     success_count = 0
     
@@ -262,7 +260,7 @@ def batch_process(
                     time.sleep(sleep_time)
                 
                 # Submit task to thread pool
-                future = executor.submit(process_symbol, symbol, function, batch_id, force_refresh)
+                future = executor.submit(process_symbol, symbol, function, batch_timestamp, force_refresh)
                 if future.result():
                     success_count += 1
     else:
@@ -274,10 +272,10 @@ def batch_process(
                 logger.info(f"Rate limiting: sleeping for {sleep_time} seconds")
                 time.sleep(sleep_time)
             
-            if process_symbol(symbol, function, batch_id, force_refresh):
+            if process_symbol(symbol, function, batch_timestamp, force_refresh):
                 success_count += 1
     
-    logger.info(f"Batch {batch_id} completed: {success_count}/{len(tasks)} successful")
+    logger.info(f"Batch at {batch_timestamp} completed: {success_count}/{len(tasks)} successful")
     return success_count
 
 if __name__ == "__main__":

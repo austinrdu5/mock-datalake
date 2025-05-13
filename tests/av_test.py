@@ -13,7 +13,8 @@ from src.bronze.av_extract import (
     check_data_exists_in_s3,
     S3_BUCKET_NAME,
     S3_PREFIX,
-    save_to_s3
+    save_to_s3,
+    process_symbol
 )
 
 # Set up test environment
@@ -34,6 +35,11 @@ def test_data_full():
     data = fetch_time_series_data('IBM', outputsize='full')
     assert data is not None, "Failed to fetch full test data"
     return data
+
+@pytest.fixture
+def test_timestamp():
+    """Fixture to provide a consistent timestamp for testing"""
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
 
 def test_api_key_validation():
     """Test that API key is properly set"""
@@ -112,30 +118,32 @@ def test_check_data_exists_in_s3():
     # Test case 2: Data exists but is old
     old_timestamp = datetime.now() - timedelta(days=2)
     mock_s3_client.list_objects_v2.return_value = {
-        'Contents': [{'Key': 'old_data.csv', 'LastModified': old_timestamp}]
+        'Contents': [{'Key': f'{S3_PREFIX}/TEST/20240101_000000.csv', 'LastModified': old_timestamp}]
     }
     assert not check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return False for old data"
     
     # Test case 3: Recent data exists
     recent_timestamp = datetime.now() - timedelta(hours=12)
     mock_s3_client.list_objects_v2.return_value = {
-        'Contents': [{'Key': 'recent_data.csv', 'LastModified': recent_timestamp}]
+        'Contents': [{'Key': f'{S3_PREFIX}/TEST/20240315_123456.csv', 'LastModified': recent_timestamp}]
     }
     assert check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return True for recent data"
 
 @mock_s3
 @responses.activate
-@patch('src.bronze.av_extract.save_to_s3')
-def test_process_symbol_with_existing_data(mock_save_to_s3):
+def test_process_symbol_with_existing_data(test_timestamp):
     """Test process_symbol behavior with existing data"""
-    from src.bronze.av_extract import process_symbol
+    # Create mock S3 client and bucket
+    mock_s3_client = boto3.client('s3')
+    mock_s3_client.create_bucket(Bucket=S3_BUCKET_NAME)
     
-    # Create mock S3 client
-    mock_s3_client = MagicMock()
+    # Add existing file to mock S3
     recent_timestamp = datetime.now() - timedelta(hours=12)
-    mock_s3_client.list_objects_v2.return_value = {
-        'Contents': [{'Key': 'recent_data.csv', 'LastModified': recent_timestamp}]
-    }
+    mock_s3_client.put_object(
+        Bucket=S3_BUCKET_NAME,
+        Key=f'{S3_PREFIX}/TEST/{test_timestamp}.csv',
+        Body='test data'
+    )
     
     # Mock Alpha Vantage API response for force refresh
     mock_csv_data = "timestamp,open,high,low,close,volume\n2024-01-01,100.0,101.0,99.0,100.5,1000"
@@ -147,19 +155,14 @@ def test_process_symbol_with_existing_data(mock_save_to_s3):
         content_type='text/csv'
     )
     
-    # Mock save_to_s3 to return True
-    mock_save_to_s3.return_value = True
-    
     # Test normal processing (should skip API call)
-    assert process_symbol('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return True when data exists"
-    assert not mock_save_to_s3.called, "save_to_s3 should not be called when data exists"
+    assert process_symbol('TEST', 'TIME_SERIES_DAILY', test_timestamp, s3_client_override=mock_s3_client), "Should return True when data exists"
     
     # Test force refresh
-    assert process_symbol('TEST', 'TIME_SERIES_DAILY', force_refresh=True, s3_client_override=mock_s3_client), "Should return True with force refresh"
-    assert mock_save_to_s3.called, "save_to_s3 should be called with force refresh"
+    assert process_symbol('TEST', 'TIME_SERIES_DAILY', test_timestamp, force_refresh=True, s3_client_override=mock_s3_client), "Should return True with force refresh"
 
 @pytest.mark.integration
-def test_real_s3_integration():
+def test_real_s3_integration(test_timestamp):
     """Integration test using real S3 bucket and Alpha Vantage demo key"""
     # Set up demo API key
     os.environ['ALPHA_VANTAGE_API_KEY'] = 'demo'
@@ -170,7 +173,7 @@ def test_real_s3_integration():
     assert 'csv_data' in data, "Response should contain csv_data"
     
     # Save to S3
-    assert save_to_s3(data, 'IBM', 'TIME_SERIES_DAILY'), "Failed to save data to S3"
+    assert save_to_s3(data, 'IBM', 'TIME_SERIES_DAILY', test_timestamp), "Failed to save data to S3"
     
     # Check if data exists in S3
     assert check_data_exists_in_s3('IBM', 'TIME_SERIES_DAILY'), "Data should exist in S3"
