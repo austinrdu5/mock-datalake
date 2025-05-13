@@ -22,21 +22,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize Spark session with S3 configuration
-def init_spark(aws_config: Optional[Dict[str, str]] = None):
+def init_spark(aws_config: Dict[str, str] = None):
     """Initialize the Spark session with proper S3 configurations"""
-    if aws_config is None:
-        aws_config = {
-            'access_key': os.environ.get('AWS_ACCESS_KEY'),
-            'secret_key': os.environ.get('AWS_SECRET_KEY'),
-            'bucket_name': os.environ.get('AWS_S3_BUCKET_NAME'),
-            'region': os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
-        }
-    
-    # Validate AWS credentials
-    if not all([aws_config['access_key'], aws_config['secret_key']]):
-        logger.error("AWS credentials not found in environment variables")
-        logger.error("Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
-        sys.exit(1)
     
     spark = SparkSession.builder \
         .appName("StockDataProcessor") \
@@ -55,10 +42,14 @@ def init_spark(aws_config: Optional[Dict[str, str]] = None):
     return spark
 
 # Function to get latest files for all tickers in bronze/alphavantage/
-def get_latest_files(aws_config: Dict[str, str]) -> Dict[str, str]:
+def get_latest_files(aws_config: Dict[str, str], specific_tickers: Optional[list] = None) -> Dict[str, str]:
     """
     Get the latest file path for each ticker in bronze/alphavantage/
-    Returns a dictionary mapping ticker to its latest file path
+    Args:
+        aws_config: Dictionary containing AWS configuration
+        specific_tickers: Optional list of tickers to filter for. If None, process all tickers.
+    Returns:
+        Dictionary mapping ticker to its latest file path
     """
     try:
         s3 = boto3.client(
@@ -76,6 +67,10 @@ def get_latest_files(aws_config: Dict[str, str]) -> Dict[str, str]:
         for cp in response.get('CommonPrefixes', []):
             ticker_prefix = cp.get('Prefix')  # e.g., 'bronze/alphavantage/AAPL/'
             ticker = ticker_prefix.split('/')[2]  # Extract ticker name
+            
+            # Skip if we're filtering for specific tickers and this one isn't in the list
+            if specific_tickers and ticker not in specific_tickers:
+                continue
             
             # List objects in ticker's directory
             ticker_response = s3.list_objects_v2(
@@ -193,6 +188,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Process stock data')
     parser.add_argument('--use-test-bucket', action='store_true', help='Use test S3 bucket and credentials (TEST_ prefixed environment variables)')
+    parser.add_argument('--tickers', nargs='+', help='Specific tickers to process (e.g., AAPL MSFT GOOGL)')
     
     args = parser.parse_args()
     
@@ -203,8 +199,14 @@ if __name__ == "__main__":
             'access_key': os.environ.get(f'{prefix}AWS_ACCESS_KEY'),
             'secret_key': os.environ.get(f'{prefix}AWS_SECRET_KEY'),
             'bucket_name': os.environ.get(f'{prefix}AWS_S3_BUCKET_NAME'),
-            'region': os.environ.get(f'{prefix}AWS_DEFAULT_REGION', 'us-east-1')
+            'region': os.environ.get(f'{prefix}AWS_DEFAULT_REGION')
         }
+
+        # Log AWS configuration (last 4 chars of keys for security)
+        logger.info(f"AWS Access Key (last 4): ...{aws_config['access_key'][-4:] if aws_config['access_key'] else 'None'}")
+        logger.info(f"AWS Secret Key (last 4): ...{aws_config['secret_key'][-4:] if aws_config['secret_key'] else 'None'}")
+        logger.info(f"AWS Region: {aws_config['region']}")
+        logger.info(f"AWS Bucket: {aws_config['bucket_name']}")
 
         # Validate AWS credentials
         if any(not aws_config[key] for key in aws_config):
@@ -214,9 +216,13 @@ if __name__ == "__main__":
         # Initialize Spark
         spark = init_spark(aws_config)
         
-        # Get latest files for all tickers
-        ticker_files = get_latest_files(aws_config)
+        # Get latest files for specified tickers or all tickers
+        ticker_files = get_latest_files(aws_config, args.tickers)
         logger.info(f"Found {len(ticker_files)} tickers to process")
+        
+        if args.tickers and not ticker_files:
+            logger.error(f"No files found for specified tickers: {args.tickers}")
+            sys.exit(1)
         
         # Process each ticker's latest file
         for ticker, file_path in ticker_files.items():
@@ -226,12 +232,8 @@ if __name__ == "__main__":
             silver_df = process_stock_ticker(spark, ticker, file_path)
             
             if silver_df is not None:
-                # Show sample of the data
-                logger.info(f"Sample of Silver Layer for {ticker}:")
-                silver_df.show(2, truncate=False)
-                
                 # Save to silver layer
-                silver_output_path = f"s3a://{aws_config['bucket_name']}/silver/stock_data/{ticker}"
+                silver_output_path = f"s3a://{aws_config['bucket_name']}/silver/alphavantage/{ticker}"
                 logger.info(f"Saving to {silver_output_path}")
                 
                 # Save as partitioned parquet files
