@@ -16,6 +16,7 @@ from src.bronze.av_extract import (
     save_to_s3,
     process_symbol
 )
+import re
 
 # Set up test environment
 os.environ['ALPHA_VANTAGE_API_KEY'] = 'demo'  # Using Alpha Vantage's demo API key
@@ -115,19 +116,29 @@ def test_check_data_exists_in_s3():
     mock_s3_client.list_objects_v2.return_value = {}
     assert not check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return False when no data exists"
     
-    # Test case 2: Data exists but is old
-    old_timestamp = datetime.now() - timedelta(days=2)
+    # Test case 2: Data exists but is old (2 days ago)
+    old_date = (datetime.now() - timedelta(days=2)).strftime('%Y%m%d_%H%M%S')
+    # Verify format is correct (8 digits_6 digits.csv)
+    assert re.match(r'^\d{8}_\d{6}\.csv$', f"{old_date}.csv"), "Timestamp format should be YYYYMMDD_HHMMSS.csv"
     mock_s3_client.list_objects_v2.return_value = {
-        'Contents': [{'Key': f'{S3_PREFIX}/TEST/20240101_000000.csv', 'LastModified': old_timestamp}]
+        'Contents': [{'Key': f'{S3_PREFIX}/TEST/{old_date}.csv'}]
     }
     assert not check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return False for old data"
     
-    # Test case 3: Recent data exists
-    recent_timestamp = datetime.now() - timedelta(hours=12)
+    # Test case 3: Recent data exists (12 hours ago)
+    recent_date = (datetime.now() - timedelta(hours=12)).strftime('%Y%m%d_%H%M%S')
+    # Verify format is correct (8 digits_6 digits.csv)
+    assert re.match(r'^\d{8}_\d{6}\.csv$', f"{recent_date}.csv"), "Timestamp format should be YYYYMMDD_HHMMSS.csv"
     mock_s3_client.list_objects_v2.return_value = {
-        'Contents': [{'Key': f'{S3_PREFIX}/TEST/20240315_123456.csv', 'LastModified': recent_timestamp}]
+        'Contents': [{'Key': f'{S3_PREFIX}/TEST/{recent_date}.csv'}]
     }
     assert check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return True for recent data"
+    
+    # Test case 4: Invalid filename format (no underscore)
+    mock_s3_client.list_objects_v2.return_value = {
+        'Contents': [{'Key': f'{S3_PREFIX}/TEST/20240101123456.csv'}]  # Invalid format
+    }
+    assert not check_data_exists_in_s3('TEST', 'TIME_SERIES_DAILY', s3_client_override=mock_s3_client), "Should return False for invalid filename format"
 
 @mock_s3
 @responses.activate
@@ -137,11 +148,14 @@ def test_process_symbol_with_existing_data(test_timestamp):
     mock_s3_client = boto3.client('s3')
     mock_s3_client.create_bucket(Bucket=S3_BUCKET_NAME)
     
-    # Add existing file to mock S3
+    # Add existing file to mock S3 with new timestamp format
     recent_timestamp = datetime.now() - timedelta(hours=12)
+    formatted_timestamp = recent_timestamp.strftime('%Y%m%d_%H%M%S')
+    # Verify format is correct (8 digits_6 digits.csv)
+    assert re.match(r'^\d{8}_\d{6}\.csv$', f"{formatted_timestamp}.csv"), "Timestamp format should be YYYYMMDD_HHMMSS.csv"
     mock_s3_client.put_object(
         Bucket=S3_BUCKET_NAME,
-        Key=f'{S3_PREFIX}/TEST/{test_timestamp}.csv',
+        Key=f'{S3_PREFIX}/TEST/{formatted_timestamp}.csv',
         Body='test data'
     )
     
@@ -172,14 +186,19 @@ def test_real_s3_integration(test_timestamp):
     assert data is not None, "Failed to fetch IBM data with demo key"
     assert 'csv_data' in data, "Response should contain csv_data"
     
+    # Format timestamp to match new naming scheme
+    formatted_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # Verify format is correct (8 digits_6 digits.csv)
+    assert re.match(r'^\d{8}_\d{6}\.csv$', f"{formatted_timestamp}.csv"), "Timestamp format should be YYYYMMDD_HHMMSS.csv"
+    
     # Save to S3
-    assert save_to_s3(data, 'IBM', 'TIME_SERIES_DAILY', test_timestamp), "Failed to save data to S3"
+    assert save_to_s3(data, 'IBM', 'TIME_SERIES_DAILY', formatted_timestamp), "Failed to save data to S3"
     
     # Check if data exists in S3
     assert check_data_exists_in_s3('IBM', 'TIME_SERIES_DAILY'), "Data should exist in S3"
     
     # Check with force refresh
-    assert check_data_exists_in_s3('IBM', 'TIME_SERIES_DAILY', days_threshold=0), "Data should be considered old with 0 day threshold"
+    assert not check_data_exists_in_s3('IBM', 'TIME_SERIES_DAILY', days_threshold=0), "Data should be considered old with 0 day threshold"
     
     # Clean up - delete the test file
     s3_client = boto3.client('s3')
@@ -191,6 +210,9 @@ def test_real_s3_integration(test_timestamp):
         )
         if 'Contents' in response:
             for obj in response['Contents']:
+                # Verify filename format before deletion
+                filename = obj['Key'].split('/')[-1]
+                assert re.match(r'^\d{8}_\d{6}\.csv$', filename), f"Invalid filename format: {filename}"
                 s3_client.delete_object(
                     Bucket=S3_BUCKET_NAME,
                     Key=obj['Key']

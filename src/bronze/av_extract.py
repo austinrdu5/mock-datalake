@@ -185,12 +185,16 @@ def check_data_exists_in_s3(symbol: str, function: str, days_threshold: int = 1,
         if 'Contents' not in response:
             return False
             
-        # Get the most recent file
-        latest_file = max(response['Contents'], key=lambda x: x['LastModified'])
+        # Get the most recent file based on filename timestamp
+        latest_file = max(response['Contents'], key=lambda x: x['Key'].split('/')[-1].split('.')[0])
+        filename = latest_file['Key'].split('/')[-1].split('.')[0]
+        
+        # Parse timestamp from filename (YYYYMMDD_HHMMSS)
+        file_timestamp = datetime.strptime(filename, '%Y%m%d_%H%M%S')
         
         # Check if the file is recent enough
-        time_threshold = datetime.now(latest_file['LastModified'].tzinfo) - timedelta(days=days_threshold)
-        return latest_file['LastModified'] > time_threshold
+        time_threshold = datetime.now() - timedelta(days=days_threshold)
+        return file_timestamp > time_threshold
         
     except Exception as e:
         logger.error(f"Error checking S3 for existing data: {str(e)}")
