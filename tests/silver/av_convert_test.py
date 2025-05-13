@@ -4,7 +4,39 @@ import boto3
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
-from src.silver.av_convert import init_spark, process_stock_ticker, get_latest_file
+from src.silver.av_convert import init_spark, process_stock_ticker, get_latest_files
+
+def validate_test_credentials():
+    """Validate that test credentials are properly configured"""
+    required_vars = {
+        'TEST_AWS_S3_BUCKET_NAME': os.getenv('TEST_AWS_S3_BUCKET_NAME'),
+        'TEST_AWS_ACCESS_KEY': os.getenv('TEST_AWS_ACCESS_KEY'),
+        'TEST_AWS_SECRET_KEY': os.getenv('TEST_AWS_SECRET_KEY')
+    }
+    
+    missing_vars = [var for var, value in required_vars.items() if not value]
+    if missing_vars:
+        raise ValueError(
+            f"Missing required test environment variables: {', '.join(missing_vars)}\n"
+            "Please ensure these are set in your .env file or environment."
+        )
+    
+    # Ensure test credentials are different from production
+    prod_vars = {
+        'AWS_S3_BUCKET_NAME': os.getenv('AWS_S3_BUCKET_NAME'),
+        'AWS_ACCESS_KEY': os.getenv('AWS_ACCESS_KEY'),
+        'AWS_SECRET_KEY': os.getenv('AWS_SECRET_KEY')
+    }
+    
+    for test_var, prod_var in zip(required_vars.keys(), prod_vars.keys()):
+        if required_vars[test_var] == prod_vars[prod_var]:
+            raise ValueError(
+                f"Test credentials ({test_var}) should be different from production credentials ({prod_var})\n"
+                "Please ensure you're using separate credentials for testing."
+            )
+
+# Validate test credentials before running any tests
+validate_test_credentials()
 
 # Test configuration
 TEST_BUCKET = os.getenv('TEST_AWS_S3_BUCKET_NAME')
@@ -93,15 +125,104 @@ def test_init_spark():
     finally:
         spark.stop()
 
-def test_get_latest_file(s3_client, setup_test_data):
-    """Test getting the latest file for a ticker"""
+def test_get_latest_files_single_ticker(s3_client, setup_test_data):
+    """Test getting latest files with a single ticker"""
     test_ticker, expected_path = setup_test_data
     
-    # Get the latest file
-    latest_file = get_latest_file(test_ticker, TEST_AWS_CONFIG)
+    # Get latest files
+    ticker_files = get_latest_files(TEST_AWS_CONFIG)
     
-    assert latest_file is not None
-    assert latest_file == expected_path
+    # Verify results
+    assert test_ticker in ticker_files
+    assert ticker_files[test_ticker] == expected_path
+
+def test_get_latest_files_multiple_tickers(s3_client, test_data):
+    """Test getting latest files with multiple tickers"""
+    # First, clean up any existing test data
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=TEST_BUCKET,
+            Prefix="bronze/alphavantage/"
+        )
+        for obj in response.get('Contents', []):
+            s3_client.delete_object(
+                Bucket=TEST_BUCKET,
+                Key=obj['Key']
+            )
+    except Exception as e:
+        print(f"Initial cleanup failed: {e}")
+    
+    tickers = ["AAPL", "MSFT", "GOOGL"]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create and upload test data for each ticker
+    for ticker in tickers:
+        csv_content = "timestamp,open,high,low,close,volume\n"
+        csv_content += f"{test_data['timestamp']},{test_data['open']},{test_data['high']},{test_data['low']},{test_data['close']},{test_data['volume']}"
+        
+        bronze_key = f"bronze/alphavantage/{ticker}/{timestamp}.csv"
+        s3_client.put_object(
+            Bucket=TEST_BUCKET,
+            Key=bronze_key,
+            Body=csv_content
+        )
+    
+    try:
+        # Get latest files
+        ticker_files = get_latest_files(TEST_AWS_CONFIG)
+        
+        # Verify results
+        assert len(ticker_files) == len(tickers)
+        for ticker in tickers:
+            assert ticker in ticker_files
+            assert ticker_files[ticker].endswith(f"{ticker}/{timestamp}.csv")
+    finally:
+        # Cleanup
+        for ticker in tickers:
+            try:
+                s3_client.delete_object(
+                    Bucket=TEST_BUCKET,
+                    Key=f"bronze/alphavantage/{ticker}/{timestamp}.csv"
+                )
+            except Exception as e:
+                print(f"Cleanup failed for {ticker}: {e}")
+
+def test_get_latest_files_empty_bucket(s3_client):
+    """Test getting latest files when bucket is empty"""
+    # Ensure the test prefix is empty
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=TEST_BUCKET,
+            Prefix="bronze/alphavantage/"
+        )
+        for obj in response.get('Contents', []):
+            s3_client.delete_object(
+                Bucket=TEST_BUCKET,
+                Key=obj['Key']
+            )
+    except Exception as e:
+        print(f"Cleanup failed: {e}")
+    
+    # Get latest files
+    ticker_files = get_latest_files(TEST_AWS_CONFIG)
+    
+    # Verify results
+    assert len(ticker_files) == 0
+
+def test_get_latest_files_invalid_credentials():
+    """Test getting latest files with invalid credentials"""
+    invalid_config = {
+        'access_key': 'invalid',
+        'secret_key': 'invalid',
+        'bucket_name': TEST_BUCKET,
+        'region': TEST_REGION
+    }
+    
+    # Get latest files
+    ticker_files = get_latest_files(invalid_config)
+    
+    # Verify results
+    assert len(ticker_files) == 0
 
 def test_process_stock_ticker(spark_session, setup_test_data):
     """Test processing a stock ticker's data"""

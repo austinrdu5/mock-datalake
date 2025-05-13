@@ -54,19 +54,13 @@ def init_spark(aws_config: Optional[Dict[str, str]] = None):
     
     return spark
 
-# Function to get the most recent file for a ticker
-def get_latest_file(ticker: str, aws_config: Optional[Dict[str, str]] = None):
-    """Get the latest file for a ticker from S3"""
-    if aws_config is None:
-        aws_config = {
-            'access_key': os.environ.get('AWS_ACCESS_KEY'),
-            'secret_key': os.environ.get('AWS_SECRET_KEY'),
-            'bucket_name': os.environ.get('AWS_S3_BUCKET_NAME'),
-            'region': os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
-        }
-    
+# Function to get latest files for all tickers in bronze/alphavantage/
+def get_latest_files(aws_config: Dict[str, str]) -> Dict[str, str]:
+    """
+    Get the latest file path for each ticker in bronze/alphavantage/
+    Returns a dictionary mapping ticker to its latest file path
+    """
     try:
-        # Create boto3 S3 client
         s3 = boto3.client(
             's3',
             aws_access_key_id=aws_config['access_key'],
@@ -74,31 +68,40 @@ def get_latest_file(ticker: str, aws_config: Optional[Dict[str, str]] = None):
             region_name=aws_config['region']
         )
         
-        # List objects in the ticker's directory
-        prefix = f"bronze/alphavantage/{ticker}/"
-        response = s3.list_objects_v2(Bucket=aws_config['bucket_name'], Prefix=prefix)
+        # List all tickers (folders)
+        prefix = "bronze/alphavantage/"
+        response = s3.list_objects_v2(Bucket=aws_config['bucket_name'], Prefix=prefix, Delimiter="/")
         
-        if 'Contents' not in response:
-            logger.warning(f"No files found for {ticker}")
-            return None
-        
-        # Extract just the filenames and sort them
-        files = [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith('.csv')]
-        
-        if not files:
-            logger.warning(f"No CSV files found for {ticker}")
-            return None
-        
-        # Sort by filename (which contains timestamp)
-        files.sort()
-        
-        # Get the latest file (last in the sorted list)
-        latest_file = files[-1]
-        
-        return f"s3a://{aws_config['bucket_name']}/{latest_file}"
+        ticker_files = {}
+        for cp in response.get('CommonPrefixes', []):
+            ticker_prefix = cp.get('Prefix')  # e.g., 'bronze/alphavantage/AAPL/'
+            ticker = ticker_prefix.split('/')[2]  # Extract ticker name
+            
+            # List objects in ticker's directory
+            ticker_response = s3.list_objects_v2(
+                Bucket=aws_config['bucket_name'],
+                Prefix=ticker_prefix
+            )
+            
+            if 'Contents' not in ticker_response:
+                logger.warning(f"No files found for {ticker}")
+                continue
+            
+            # Get all CSV files and sort them
+            files = [obj['Key'] for obj in ticker_response['Contents'] if obj['Key'].endswith('.csv')]
+            if not files:
+                logger.warning(f"No CSV files found for {ticker}")
+                continue
+            
+            # Sort by filename (which contains timestamp) and get the latest
+            files.sort()
+            latest_file = files[-1]
+            ticker_files[ticker] = f"s3a://{aws_config['bucket_name']}/{latest_file}"
+            
+        return ticker_files
     except Exception as e:
-        logger.error(f"Error accessing S3 for {ticker}: {e}")
-        return None
+        logger.error(f"Error getting latest files: {e}")
+        return {}
 
 # Function to process one stock ticker's data
 def process_stock_ticker(spark: SparkSession, ticker: str, latest_file_path: str):
@@ -202,22 +205,25 @@ if __name__ == "__main__":
             'bucket_name': os.environ.get(f'{prefix}AWS_S3_BUCKET_NAME'),
             'region': os.environ.get(f'{prefix}AWS_DEFAULT_REGION', 'us-east-1')
         }
+
+        # Validate AWS credentials
+        if any(not aws_config[key] for key in aws_config):
+            logger.error("Missing AWS credentials or bucket name")
+            sys.exit(1)
         
         # Initialize Spark
         spark = init_spark(aws_config)
         
-        # Define tickers to process
-        tickers = ["AAPL", "MSFT", "GOOGL"]
-        logger.info(f"Will process these tickers: {', '.join(tickers)}")
+        # Get latest files for all tickers
+        ticker_files = get_latest_files(aws_config)
+        logger.info(f"Found {len(ticker_files)} tickers to process")
         
-        # Process each ticker
-        for ticker in tickers:
-            # Get the path to the latest file
-            latest_file_path = get_latest_file(ticker, aws_config)
-            logger.info(f"Latest file for {ticker}: {latest_file_path}")
-
+        # Process each ticker's latest file
+        for ticker, file_path in ticker_files.items():
+            logger.info(f"Processing {ticker} from {file_path}")
+            
             # Process the ticker
-            silver_df = process_stock_ticker(spark, ticker, latest_file_path)
+            silver_df = process_stock_ticker(spark, ticker, file_path)
             
             if silver_df is not None:
                 # Show sample of the data
