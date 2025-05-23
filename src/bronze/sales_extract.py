@@ -78,7 +78,7 @@ def stream_zip_to_s3(url: str, s3_bucket: str, prefix: str = "bronze/sales_data"
             return False
             
         # Current date for organizing data
-        date_prefix = datetime.utcnow().strftime("%Y/%m/%d")
+        date_prefix = datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
         
         # Process the ZIP file in memory
         with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
@@ -106,7 +106,7 @@ def stream_zip_to_s3(url: str, s3_bucket: str, prefix: str = "bronze/sales_data"
                     
                     # Metadata including ingestion timestamp
                     metadata = {
-                        'ingestion_timestamp': datetime.utcnow().isoformat(),
+                        'ingestion_timestamp': datetime.now(datetime.timezone.utc).isoformat(),
                         'source': 'sample_sales_data',
                         'content_type': 'application/json',
                         'origin_url': url

@@ -12,6 +12,9 @@ import os
 import sys
 import logging
 from typing import Optional, Dict, Any
+import pandera as pa
+from pandera import Column, Check
+import pandas as pd
 
 # Set up logging
 logging.basicConfig(
@@ -173,7 +176,43 @@ def process_stock_ticker(spark: SparkSession, ticker: str, latest_file_path: str
             "source_system", "source_file", "batch_id", "record_id",
             "completeness_score", "data_confidence"
         ])
-        
+
+        # Convert to pandas DataFrame for Pandera validation
+        result_pd = result_df.toPandas()
+
+        # Ensure datetime columns are correct dtype for Pandera
+        for dt_col in ["trade_date", "processing_timestamp", "effective_from", "effective_to"]:
+            if dt_col in result_pd.columns:
+                result_pd[dt_col] = pd.to_datetime(result_pd[dt_col], errors='coerce')
+
+        # Define Pandera schema for output validation
+        silver_schema = pa.DataFrameSchema({
+            "ticker": Column(str),
+            "trade_date": Column(pa.DateTime, nullable=True),
+            "open_price": Column(float, nullable=True),
+            "high_price": Column(float, nullable=True),
+            "low_price": Column(float, nullable=True),
+            "close_price": Column(float, nullable=True),
+            "volume": Column(float, nullable=True),
+            "processing_timestamp": Column(pa.DateTime),
+            "effective_from": Column(pa.DateTime, nullable=True),
+            "effective_to": Column(pa.DateTime, nullable=True),
+            "source_system": Column(str),
+            "source_file": Column(str),
+            "batch_id": Column(str),
+            "record_id": Column(str),
+            "completeness_score": Column(float),
+            "data_confidence": Column(float)
+        })
+
+        # Validate output
+        try:
+            silver_schema.validate(result_pd)
+            logger.info(f"Pandera output validation passed for {ticker}")
+        except pa.errors.SchemaError as e:
+            logger.error(f"Pandera output validation failed for {ticker}: {e}")
+            return None
+
         # Count records
         record_count = result_df.count()
         logger.info(f"Processed {record_count} records for {ticker}")
