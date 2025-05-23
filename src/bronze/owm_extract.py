@@ -5,7 +5,7 @@ import boto3
 import datetime
 from dotenv import load_dotenv
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 import time
 from ratelimit import limits, sleep_and_retry
 import argparse
@@ -15,6 +15,9 @@ import pandera.pandas as pa
 from pandera.typing import Series
 import pandas as pd
 import numpy as np
+from calendar import monthrange
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import jsonschema
 
 # Set up logging
 logging.basicConfig(
@@ -30,72 +33,56 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Define Pandera schema for OpenWeatherMap bronze data
-class OpenWeatherMapBronzeSchema(pa.DataFrameModel):
-    # Location fields
-    lat: Series[float] = pa.Field(ge=-90, le=90)
-    lon: Series[float] = pa.Field(ge=-180, le=180)
-    dt: Series[np.int32] = pa.Field()  # Unix timestamp
-    
-    # Weather measurements
-    temp: Series[float] = pa.Field(nullable=True)
-    feels_like: Series[float] = pa.Field(nullable=True)
-    pressure: Series[np.int32] = pa.Field(nullable=True)
-    humidity: Series[np.int32] = pa.Field(ge=0, le=100, nullable=True)
-    dew_point: Series[float] = pa.Field(nullable=True)
-    uvi: Series[float] = pa.Field(nullable=True)
-    clouds: Series[np.int32] = pa.Field(ge=0, le=100, nullable=True)
-    visibility: Series[np.int32] = pa.Field(nullable=True)
-    wind_speed: Series[float] = pa.Field(nullable=True)
-    wind_deg: Series[np.int32] = pa.Field(ge=0, le=360, nullable=True)
-    wind_gust: Series[float] = pa.Field(nullable=True)
-    
-    # Weather conditions array
-    weather: Series[object] = pa.Field()  # Array of weather conditions
-    
-    # Metadata fields (flattened)
-    source: Series[str] = pa.Field()
-    ingestion_timestamp: Series[str] = pa.Field()
-    city: Series[str] = pa.Field()
-    timezone: Series[str] = pa.Field(nullable=True)
-    timezone_offset: Series[np.int32] = pa.Field(nullable=True)
-    
-    class Config:
-        strict = True
+# Define JSON schema for OpenWeatherMap bronze data
+OPENWEATHERMAP_BRONZE_JSONSCHEMA = {
+    "type": "object",
+    "properties": {
+        "lat": {"type": "number", "minimum": -90, "maximum": 90},
+        "lon": {"type": "number", "minimum": -180, "maximum": 180},
+        "date": {"type": "string"},
+        "cloud_cover_afternoon": {"type": "integer", "minimum": 0, "maximum": 100},
+        "humidity_afternoon": {"type": "integer", "minimum": 0, "maximum": 100},
+        "precipitation_total": {"type": "number"},
+        "temperature_min": {"type": "number"},
+        "temperature_max": {"type": "number"},
+        "temperature_afternoon": {"type": "number"},
+        "temperature_night": {"type": "number"},
+        "temperature_evening": {"type": "number"},
+        "temperature_morning": {"type": "number"},
+        "pressure_afternoon": {"type": "integer"},
+        "wind_max_speed": {"type": "number"},
+        "wind_max_direction": {"type": "integer", "minimum": 0, "maximum": 360},
+        "source": {"type": "string"},
+        "ingestion_timestamp": {"type": "string"},
+        "city": {"type": "string"},
+        "timezone": {"type": "string"}
+    },
+    "required": [
+        "lat", "lon", "date", "cloud_cover_afternoon", "humidity_afternoon", "precipitation_total",
+        "temperature_min", "temperature_max", "temperature_afternoon", "temperature_night",
+        "temperature_evening", "temperature_morning", "pressure_afternoon", "wind_max_speed",
+        "wind_max_direction", "source", "ingestion_timestamp", "city", "timezone"
+    ]
+}
 
-def validate_bronze_data(data: Dict[str, Any]) -> bool:
+def validate_bronze_data(data: dict) -> bool:
     """
-    Validate the bronze data using Pandera schema
-    
+    Validate the bronze data using JSON schema
     Args:
         data: Dictionary containing weather data
-        
     Returns:
         bool: True if validation passes, False otherwise
     """
     try:
-        # Convert single record to DataFrame
-        df = pd.DataFrame([data])
-        
-        # Cast integer fields to int32
-        int_fields = ['dt', 'pressure', 'humidity', 'clouds', 'visibility', 'wind_deg', 'timezone_offset']
-        for field in int_fields:
-            if field in df.columns and df[field].notna().any():
-                df[field] = df[field].astype(np.int32)
-        
-        # Validate using Pandera schema
-        OpenWeatherMapBronzeSchema.validate(df)
+        jsonschema.validate(instance=data, schema=OPENWEATHERMAP_BRONZE_JSONSCHEMA)
         return True
-    except pa.errors.SchemaError as e:
-        logger.error(f"Data validation failed: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Error during validation: {e}")
+    except jsonschema.ValidationError as e:
+        logger.error(f"Data validation failed: {e.message}")
         return False
 
 # Constants
 BASIC_URL = "https://api.openweathermap.org/data/2.5/weather"
-HISTORY_URL = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
+HISTORY_URL = "https://api.openweathermap.org/data/3.0/onecall/day_summary"
 
 # Rate limiting configuration
 CALLS_PER_MINUTE = 30
@@ -138,140 +125,63 @@ def get_lat_lon(city: str, api_key: str) -> Tuple[float, float]:
         if e.response is not None:
             error_msg = f"{e.response.status_code}: {e.response.text}"
         raise Exception(error_msg)
-    except Exception as e:
-        raise Exception(str(e))
 
-@sleep_and_retry
-@limits(calls=CALLS_PER_MINUTE, period=ONE_MINUTE)
-def fetch_historical_weather(lat: float, lon: float, dt: int, api_key: str) -> Dict[str, Any]:
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=10, max=60),
+    retry=retry_if_exception_type((requests.exceptions.HTTPError, KeyError, ValueError, Exception)),
+    before_sleep=lambda retry_state: logger.warning(
+        f"Attempt {retry_state.attempt_number} failed. Retrying soon..."
+    )
+)
+def fetch_historical_weather(lat: float, lon: float, date: str, api_key: str) -> Dict[str, Any]:
     """
-    Fetch historical weather data for a specific location and time
+    Fetch historical weather data for a specific location and date
     
     Args:
         lat: Latitude
         lon: Longitude
-        dt: Unix timestamp
+        date: Date in YYYY-MM-DD format
         api_key: OpenWeatherMap API key
         
     Returns:
         Dictionary containing weather data
         
     Raises:
-        Exception: If API call fails
+        Exception: If API call fails after all retries
     """
-    logger.info(f"Making API call for coordinates ({lat}, {lon}) at timestamp {dt}")
+    logger.info(f"Making API call for coordinates ({lat}, {lon}) for date {date}")
     params = {
         'lat': lat,
         'lon': lon,
-        'dt': dt,
+        'date': date,
         'appid': api_key,
         'units': 'metric'
     }
     
     response = requests.get(HISTORY_URL, params=params)
     response.raise_for_status()
-    logger.info(f"Successfully received API response for timestamp {dt}")
+    logger.info(f"Successfully received API response for date {date}")
     return response.json()
 
-def fetch_with_retry(lat: float, lon: float, dt: int, city: str, api_key: str) -> Tuple[Dict[str, Any], Optional[str]]:
+def get_existing_s3_paths(cities: List[str], months: List[Tuple[int, int]], aws_config: Optional[Dict[str, str]] = None) -> set:
     """
-    Fetch weather data with retry mechanism
-    
-    Args:
-        lat: Latitude
-        lon: Longitude
-        dt: Unix timestamp
-        city: City name
-        api_key: OpenWeatherMap API key
-        
-    Returns:
-        Tuple of (data, error_message)
-    """
-    for delay in RETRY_DELAYS:
-        try:
-            data = fetch_historical_weather(lat, lon, dt, api_key)
-            
-            # Extract the first data point from the array
-            if 'data' in data and len(data['data']) > 0:
-                weather_data = data['data'][0]
-                # Process data with flattened metadata
-                processed_data = {
-                    'lat': data['lat'],
-                    'lon': data['lon'],
-                    'dt': dt,  # Use the input timestamp instead of the response timestamp
-                    'temp': weather_data.get('temp'),
-                    'feels_like': weather_data.get('feels_like'),
-                    'pressure': weather_data.get('pressure'),
-                    'humidity': weather_data.get('humidity'),
-                    'dew_point': weather_data.get('dew_point'),
-                    'uvi': weather_data.get('uvi'),
-                    'clouds': weather_data.get('clouds'),
-                    'visibility': weather_data.get('visibility'),
-                    'wind_speed': weather_data.get('wind_speed'),
-                    'wind_deg': weather_data.get('wind_deg'),
-                    'wind_gust': weather_data.get('wind_gust'),
-                    'weather': weather_data.get('weather', []),
-                    # Flattened metadata fields
-                    'source': 'openweathermap',
-                    'ingestion_timestamp': datetime.datetime.now().isoformat(),
-                    'city': city,
-                    'timezone': data.get('timezone'),
-                    'timezone_offset': data.get('timezone_offset')
-                }
-                
-                # Validate required fields
-                if not all(key in processed_data for key in ['dt', 'weather']):
-                    raise KeyError("Missing required fields: dt or weather")
-                
-                # Validate data using Pandera schema
-                if not validate_bronze_data(processed_data):
-                    raise ValueError("Data validation failed")
-                    
-                return processed_data, None
-            else:
-                raise ValueError("No weather data found in response")
-            
-        except requests.exceptions.HTTPError as e:
-            error_msg = str(e)
-            if e.response is not None:
-                error_msg = f"{e.response.status_code}: {e.response.text}"
-            logger.warning(f"Attempt failed for {city} at {dt}: {error_msg}")
-            if delay == RETRY_DELAYS[-1]:  # Last retry
-                return None, error_msg
-            time.sleep(delay)
-        except (KeyError, ValueError) as e:
-            error_msg = str(e)
-            logger.warning(f"Attempt failed for {city} at {dt}: {error_msg}")
-            if delay == RETRY_DELAYS[-1]:  # Last retry
-                return None, error_msg
-            time.sleep(delay)
-        except Exception as e:
-            error_msg = str(e)
-            logger.warning(f"Attempt failed for {city} at {dt}: {error_msg}")
-            if delay == RETRY_DELAYS[-1]:  # Last retry
-                return None, error_msg
-            time.sleep(delay)
-    
-    return None, "All retry attempts failed"
-
-def get_existing_s3_paths(cities: List[str], dates: List[datetime.datetime], aws_config: Optional[Dict[str, str]] = None) -> set:
-    """
-    Get a set of existing S3 paths for given cities and dates using a single S3 listing call
+    Get a set of existing S3 paths for given cities and months using a single S3 listing call
     
     Args:
         cities: List of city names
-        dates: List of datetime objects
-        aws_config: Optional dictionary containing AWS configuration. If not provided, will use environment variables.
+        months: List of (year, month) tuples
+        aws_config: Optional dictionary containing AWS configuration
         
     Returns:
         set: Set of existing S3 paths
-        
-    Raises:
-        ValueError: If AWS credentials or bucket name are not set
     """
-    AWS_ACCESS_KEY = aws_config['access_key']
-    AWS_SECRET_KEY = aws_config['secret_key']
-    S3_BUCKET = aws_config['bucket']
+    if aws_config is None:
+        raise ValueError("AWS configuration is required")
+        
+    AWS_ACCESS_KEY = aws_config.get('access_key')
+    AWS_SECRET_KEY = aws_config.get('secret_key')
+    S3_BUCKET = aws_config.get('bucket')
     AWS_REGION = aws_config.get('region')
     
     if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
@@ -302,7 +212,6 @@ def get_existing_s3_paths(cities: List[str], dates: List[datetime.datetime], aws
         logger.info(f"Found {len(existing_paths)} existing files in S3")
     except Exception as e:
         logger.warning(f"Error listing S3 objects: {str(e)}")
-        # Return empty set on error
         return set()
     
     return existing_paths
@@ -310,95 +219,48 @@ def get_existing_s3_paths(cities: List[str], dates: List[datetime.datetime], aws
 def extract_historical_weather_for_cities(
     city_list: List[str],
     api_key: str,
-    dates: Optional[List[datetime.datetime]] = None,
+    months: List[Tuple[int, int]],
     aws_config: Optional[Dict[str, str]] = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Extract historical weather data for multiple cities and dates
+    Extract historical weather data for multiple cities and months
     
     Args:
         city_list: List of city names
         api_key: OpenWeatherMap API key
-        dates: List of dates to fetch data for. If None, uses default range
-        aws_config: Dictionary containing AWS configuration (access_key, secret_key, bucket, region)
+        months: List of (year, month) tuples. If None, uses default range
+        aws_config: Dictionary containing AWS configuration
         
     Returns:
         Tuple of (successful_results, failures)
-        
-    Raises:
-        ValueError: If dates are not in chronological order or if API key is not set
     """
     if not city_list:
         return [], []
-        
-    if dates is None:
-        # Default date range: Jan 1, 2025 to Jan 3, 2025 (3 days)
-        start_date = datetime.datetime(2025, 1, 1)
-        end_date = datetime.datetime(2025, 1, 3)
-        dates = [start_date + datetime.timedelta(days=x) for x in range((end_date - start_date).days + 1)]
-    else:
-        # Validate dates are in chronological order
-        sorted_dates = sorted(dates)
-        if dates != sorted_dates:
-            raise ValueError("Dates must be provided in chronological order")
     
     results = []
     failures = []
     
     # Get all existing S3 paths in one call
-    existing_paths = get_existing_s3_paths(city_list, dates, aws_config)
+    existing_paths = get_existing_s3_paths(city_list, months, aws_config)
     
-    # Process each city and date combination
+    # Process each city and month combination
     for city in city_list:
         # Normalize city name for path checking
         normalized_city = city.lower().replace(' ', '_')
         
-        # Check if we need to fetch coordinates
-        need_coords = False
-        dates_to_fetch = []
-        for date in dates:
-            # First get the timezone for this city
-            try:
-                # Get current weather to get timezone info
-                params = {
-                    'q': city,
-                    'appid': api_key
-                }
-                response = requests.get(BASIC_URL, params=params)
-                response.raise_for_status()
-                timezone_data = response.json()
-                
-                # Get timezone offset in seconds
-                timezone_offset = timezone_data.get('timezone', 0)
-                
-                # Create local time (9:00 AM) in the city's timezone
-                local_time = datetime.datetime.combine(date.date(), datetime.time(9, 0))
-                local_tz = datetime.timezone(datetime.timedelta(seconds=timezone_offset))
-                local_time = local_time.replace(tzinfo=local_tz)
-                
-                # Convert to UTC timestamp for API
-                utc_time = local_time.astimezone(datetime.timezone.utc)
-                dt = int(utc_time.timestamp())
-                
-                # Use UTC time for S3 key with normalized city name
-                s3_key = f"bronze/openweathermap/city={normalized_city}/{utc_time.strftime('%Y-%m-%d_%H-%M')}UTC.json"
-                
-                if s3_key not in existing_paths:
-                    need_coords = True
-                    dates_to_fetch.append((date, dt, s3_key))
-                    logger.info(f"Need to fetch data for {city} on {date.date()} - file {s3_key} not found in S3")
-                else:
-                    logger.info(f"Skipping {city} on {date.date()} - file {s3_key} already exists in S3")
-            except Exception as e:
-                logger.error(f"Failed to get timezone for {city}: {str(e)}")
-                failures.append({
-                    'city': city,
-                    'date': date,
-                    'error': f"Timezone error: {str(e)}"
-                })
-                continue
+        # Check if data already exists in S3
+        months_to_fetch = []
+        for year, month in months:
+            # Create S3 key for this month
+            s3_key = f"bronze/openweathermap/city={normalized_city}/year={year}/{month:02d}.json"
+            
+            if s3_key not in existing_paths:
+                months_to_fetch.append((year, month, s3_key))
+                logger.info(f"Need to fetch data for {city} in {year}-{month:02d} - file {s3_key} not found in S3")
+            else:
+                logger.info(f"Skipping {city} for {year}-{month:02d} - file {s3_key} already exists in S3")
         
-        if not need_coords:
+        if len(months_to_fetch) == 0:
             logger.info(f"All data exists in S3 for {city}, skipping API calls")
             continue
             
@@ -408,69 +270,70 @@ def extract_historical_weather_for_cities(
             logger.error(f"Failed to get coordinates for {city}: {str(e)}")
             failures.append({
                 'city': city,
-                'date': None,
+                'year': None,
+                'month': None,
                 'error': str(e)
             })
             continue
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_params = {}
+        # Process each month
+        for year, month, s3_key in months_to_fetch:
+            daily_data = []
+            # Get number of days in the month
+            _, num_days = monthrange(year, month)
             
-            for date, dt, s3_key in dates_to_fetch:
-                future = executor.submit(fetch_with_retry, lat, lon, dt, city, api_key)
-                future_to_params[future] = (city, dt)
-            
-            for future in concurrent.futures.as_completed(future_to_params):
-                city, dt = future_to_params[future]
+            # Fetch data for each day
+            for day in range(1, num_days + 1):
+                date = f"{year}-{month:02d}-{day:02d}"
                 try:
-                    data, error = future.result()
-                    if error:
-                        failures.append({
-                            'city': city,
-                            'date': datetime.datetime.fromtimestamp(dt),
-                            'error': error
-                        })
-                    else:
-                        try:
-                            # Validate required fields
-                            if not all(key in data for key in ['dt', 'weather']):
-                                raise KeyError("Missing required fields: dt or weather")
-                            results.append(data)
-                        except KeyError as e:
-                            failures.append({
-                                'city': city,
-                                'date': datetime.datetime.fromtimestamp(dt),
-                                'error': f"KeyError: {str(e)}"
-                            })
+                    data = fetch_historical_weather(lat, lon, date, api_key)
+                    daily_data.append(data)
                 except Exception as e:
                     failures.append({
                         'city': city,
-                        'date': datetime.datetime.fromtimestamp(dt),
+                        'year': year,
+                        'month': month,
+                        'day': day,
                         'error': str(e)
                     })
+            
+            if daily_data:
+                # Create monthly file with metadata
+                monthly_data = {
+                    'metadata': {
+                        'city': city,
+                        'year': year,
+                        'month': month,
+                        'source': 'openweathermap',
+                        'ingestion_timestamp': datetime.datetime.now().isoformat(),
+                        'record_count': len(daily_data)
+                    },
+                    'data': daily_data
+                }
+                # Add to results
+                results.append({
+                    'city': city,
+                    'year': year,
+                    'month': month,
+                    'data': monthly_data,
+                    's3_key': s3_key
+                })
     
     return results, failures
 
-def save_to_s3(data: List[Dict[str, Any]], aws_config: Dict[str, str], batch_id: Optional[str] = None) -> bool:
+def save_to_s3(data: List[Dict[str, Any]], aws_config: Dict[str, str]) -> bool:
     """
-    Save the weather data to S3 bronze layer with new path structure
+    Save the weather data to S3 bronze layer with monthly batching
     
     Args:
-        data: List of dictionaries containing weather data
-        aws_config: Dictionary containing AWS configuration (access_key, secret_key, bucket, region)
-        batch_id: Optional batch identifier. If None, current timestamp will be used
+        data: List of dictionaries containing monthly weather data
+        aws_config: Dictionary containing AWS configuration
         
     Returns:
         bool: True if save was successful, False otherwise
-        
-    Raises:
-        ValueError: If AWS credentials or bucket name are not set
     """
-    if not data:  # Return early if no data to save
+    if not data:
         return True
-        
-    if batch_id is None:
-        batch_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     
     # Initialize S3 client
     s3_client = boto3.client(
@@ -481,29 +344,19 @@ def save_to_s3(data: List[Dict[str, Any]], aws_config: Dict[str, str], batch_id:
     )
     
     try:
-        # Group data by city and date
-        for item in data:
-            # Normalize city name: lowercase and replace spaces with underscores
-            city = item['city'].lower().replace(' ', '_')
-            
-            # Convert timestamp to UTC datetime
-            dt = datetime.datetime.fromtimestamp(item['dt'], tz=datetime.timezone.utc)
-            
-            # Create S3 path with new format using UTC timestamp
-            s3_key = f"bronze/openweathermap/city={city}/{dt.strftime('%Y-%m-%d_%H-%M')}UTC.json"
-            
-            # Convert single item to JSON
-            json_data = json.dumps(item)
+        for month_data in data:
+            # Convert month data to JSON
+            json_data = json.dumps(month_data)
             
             # Upload to S3
             s3_client.put_object(
                 Bucket=aws_config['bucket'],
-                Key=s3_key,
+                Key=month_data['s3_key'],
                 Body=json_data,
                 ContentType='application/json'
             )
             
-            logger.info(f"Successfully saved data to {s3_key}")
+            logger.info(f"Successfully saved data to {month_data['s3_key']}")
         
         return True
     
@@ -521,12 +374,16 @@ def main() -> int:
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Extract historical weather data from OpenWeatherMap API')
     parser.add_argument('--cities', nargs='+', help='List of cities to fetch weather data for')
-    parser.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
-    parser.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
+    parser.add_argument('--start-month', type=str, help='Start month (YYYY-MM)')
+    parser.add_argument('--end-month', type=str, help='End month (YYYY-MM)')
     args = parser.parse_args()
 
     # Get environment variables
     api_key = os.getenv('OPENWEATHERMAP_API_KEY')
+    if not api_key:
+        logger.error("OPENWEATHERMAP_API_KEY environment variable is not set")
+        return 1
+        
     aws_config = {
         'access_key': os.getenv('AWS_ACCESS_KEY'),
         'secret_key': os.getenv('AWS_SECRET_KEY'),
@@ -537,16 +394,35 @@ def main() -> int:
     logger.info("Starting OpenWeatherMap historical data extraction")
     
     try:
-        # Parse dates if provided
-        dates = None
-        if args.start_date and args.end_date:
-            start_date = datetime.datetime.strptime(args.start_date, '%Y-%m-%d')
-            end_date = datetime.datetime.strptime(args.end_date, '%Y-%m-%d')
-            dates = [start_date + datetime.timedelta(days=x) for x in range((end_date - start_date).days + 1)]
+        # Parse months if provided, otherwise use default range
+        if args.start_month and args.end_month:
+            start_date = datetime.datetime.strptime(args.start_month, '%Y-%m')
+            end_date = datetime.datetime.strptime(args.end_month, '%Y-%m')
+        else:
+            # Default to Jan 2024 to Mar 2024
+            start_date = datetime.datetime(2024, 1, 1)
+            end_date = datetime.datetime(2024, 3, 1)
+            logger.info(f"Using default date range: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')}")
+        
+        # Generate list of (year, month) tuples
+        months = []
+        current = start_date
+        while current <= end_date:
+            months.append((current.year, current.month))
+            # Move to next month
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
         
         # Fetch weather data
-        city_list = args.cities if args.cities else ['London', 'New York', 'Tokyo', 'Sydney', 'Berlin']
-        weather_data, failures = extract_historical_weather_for_cities(city_list=city_list, api_key=api_key, dates=dates, aws_config=aws_config)
+        city_list = args.cities if args.cities else ['London', 'New York']
+        weather_data, failures = extract_historical_weather_for_cities(
+            city_list=city_list,
+            api_key=api_key,
+            months=months,
+            aws_config=aws_config
+        )
         
         if not weather_data:
             logger.error("No weather data retrieved. Exiting.")
@@ -554,9 +430,9 @@ def main() -> int:
         
         # Log summary of failures
         if failures:
-            logger.warning(f"Failed to retrieve data for {len(failures)} city-date combinations:")
+            logger.warning(f"Failed to retrieve data for {len(failures)} city-month combinations:")
             for fail in failures:
-                logger.warning(f"City: {fail['city']}, Date: {fail['date']}, Error: {fail['error']}")
+                logger.warning(f"City: {fail['city']}, Year: {fail['year']}, Month: {fail['month']}, Error: {fail['error']}")
         
         # Save to S3
         success = save_to_s3(weather_data, aws_config)

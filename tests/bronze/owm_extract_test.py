@@ -13,6 +13,7 @@ import pandas as pd
 import pandera.pandas as pa
 from pandera.errors import SchemaError
 import uuid
+from calendar import monthrange
 
 # Load environment variables
 load_dotenv()
@@ -25,13 +26,13 @@ def sample_city_list():
     return ["London", "New York"]
 
 @pytest.fixture
-def sample_dates():
-    # Use recent dates that are guaranteed to have data
+def sample_months():
+    # Use recent months that are guaranteed to have data
     today = datetime.now()
     return [
-        today - timedelta(days=3),  # Oldest first
-        today - timedelta(days=2),
-        today - timedelta(days=1),
+        (today.year, today.month - 2),  # Two months ago
+        (today.year, today.month - 1),  # Last month
+        (today.year, today.month),      # Current month
     ]
 
 @pytest.fixture
@@ -41,7 +42,7 @@ def aws_config():
         'access_key': os.getenv('TEST_AWS_ACCESS_KEY'),
         'secret_key': os.getenv('TEST_AWS_SECRET_KEY'),
         'bucket': os.getenv('TEST_AWS_S3_BUCKET_NAME'),
-        'region': os.getenv('TEST_AWS_DEFAULT_REGION', 'us-east-1')
+        'region': os.getenv('TEST_AWS_DEFAULT_REGION')
     }
 
 @pytest.fixture
@@ -84,30 +85,46 @@ def sample_weather_data():
     return {
         'lat': 51.5074,
         'lon': -0.1278,
-        'dt': int(datetime.now().timestamp()),
-        'temp': 20.5,
-        'feels_like': 19.8,
-        'pressure': 1015,  # int32
-        'humidity': 65,    # int32
-        'dew_point': 15.2,
-        'uvi': 5.2,
-        'clouds': 20,      # int32
-        'visibility': 10000,  # int32
-        'wind_speed': 5.5,
-        'wind_deg': 180,   # int32
-        'wind_gust': 7.2,
-        'weather': [{
-            'id': 800,
-            'main': 'Clear',
-            'description': 'clear sky',
-            'icon': '01d'
-        }],
-        # Flattened metadata fields
+        'date': '2024-03-22',
+        'cloud_cover_afternoon': 20,
+        'humidity_afternoon': 65,
+        'precipitation_total': 0.0,
+        'temperature_min': 10.0,
+        'temperature_max': 15.0,
+        'temperature_afternoon': 14.0,
+        'temperature_night': 11.0,
+        'temperature_evening': 13.0,
+        'temperature_morning': 12.0,
+        'pressure_afternoon': 1015,
+        'wind_max_speed': 5.5,
+        'wind_max_direction': 180,
         'source': 'openweathermap',
         'ingestion_timestamp': datetime.now().isoformat(),
         'city': 'London',
-        'timezone': 'Europe/London',
-        'timezone_offset': 0
+        'timezone': 'Europe/London'
+    }
+
+@pytest.fixture
+def sample_monthly_data(sample_weather_data):
+    """Fixture to provide sample monthly weather data"""
+    year, month = datetime.now().year, datetime.now().month
+    _, num_days = monthrange(year, month)
+    
+    # Create a list of daily weather data for the month
+    daily_data = []
+    for day in range(1, num_days + 1):
+        day_data = sample_weather_data.copy()
+        # Set timestamp to 9:00 AM on each day
+        dt = datetime(year, month, day, 9, 0, tzinfo=timezone.utc)
+        day_data['dt'] = int(dt.timestamp())
+        daily_data.append(day_data)
+    
+    return {
+        'city': sample_weather_data['city'],
+        'year': year,
+        'month': month,
+        'data': daily_data,
+        's3_key': f"bronze/openweathermap/city={sample_weather_data['city'].lower().replace(' ', '_')}/year={year}/{month:02d}.json"
     }
 
 def test_get_lat_lon(api_key):
@@ -121,68 +138,91 @@ def test_get_lat_lon(api_key):
 def test_fetch_historical_weather(api_key):
     """Test that we can fetch historical weather data"""
     lat, lon = omw.get_lat_lon("London", api_key)
-    yesterday = int((datetime.now() - timedelta(days=1)).timestamp())
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
     data = omw.fetch_historical_weather(lat, lon, yesterday, api_key)
     
     assert isinstance(data, dict)
     assert "lat" in data
     assert "lon" in data
-    assert "data" in data
-    assert isinstance(data["data"], list)
-    assert len(data["data"]) > 0
-    assert "dt" in data["data"][0]
-    assert "weather" in data["data"][0]
+    assert "date" in data
+    assert "temperature" in data
+    assert "humidity" in data
+    assert "cloud_cover" in data
 
-def test_extract_historical_weather_for_cities(sample_city_list, sample_dates, api_key, sample_weather_data, aws_config):
+def test_extract_historical_weather_for_cities(sample_city_list, sample_months, api_key, sample_weather_data, aws_config):
     """Test the full extraction process with validation"""
-    with patch('src.bronze.owm_extract.fetch_with_retry') as mock_fetch, \
+    with patch('src.bronze.owm_extract.fetch_historical_weather') as mock_fetch, \
          patch('src.bronze.owm_extract.get_lat_lon') as mock_get_coords:
         
         # Setup mock returns with valid data
         mock_get_coords.return_value = (51.5074, -0.1278)
-        mock_fetch.return_value = (sample_weather_data, None)
+        mock_fetch.return_value = {
+            'lat': 51.5074,
+            'lon': -0.1278,
+            'date': '2024-03-22',
+            'temperature': {
+                'min': 10.0,
+                'max': 15.0,
+                'afternoon': 14.0,
+                'night': 11.0,
+                'evening': 13.0,
+                'morning': 12.0
+            },
+            'humidity': {'afternoon': 65},
+            'cloud_cover': {'afternoon': 20},
+            'pressure': {'afternoon': 1015},
+            'wind': {
+                'max_speed': 5.5,
+                'max_direction': 180
+            },
+            'precipitation': {'total': 0.0},
+            'source': 'openweathermap',
+            'ingestion_timestamp': datetime.now().isoformat(),
+            'city': 'London',
+            'timezone': 'Europe/London'
+        }
         
         results, failures = omw.extract_historical_weather_for_cities(
             city_list=sample_city_list,
             api_key=api_key,
-            dates=sample_dates,
+            months=sample_months,
             aws_config=aws_config
         )
         
         # Verify results
         assert len(results) > 0
         for result in results:
-            assert omw.validate_bronze_data(result) is True
+            assert isinstance(result, dict)
+            assert 'city' in result
+            assert 'year' in result
+            assert 'month' in result
+            assert 'data' in result
+            assert isinstance(result['data'], dict)
+            assert 'data' in result['data']
+            assert isinstance(result['data']['data'], list)
+            assert len(result['data']['data']) > 0
             assert result['city'] in sample_city_list
 
-
-def test_save_to_s3_real_bucket(aws_config, sample_weather_data, s3_client):
+def test_save_to_s3_real_bucket(aws_config, sample_monthly_data, s3_client):
     """Test saving data to real S3 bucket"""
-    # Ensure data is valid before saving
-    assert omw.validate_bronze_data(sample_weather_data) is True
-    
     # Save to S3
-    success = omw.save_to_s3([sample_weather_data], aws_config)
+    success = omw.save_to_s3([sample_monthly_data], aws_config)
     assert success is True
     
-    # Construct the expected S3 key
-    city = sample_weather_data['city'].lower().replace(' ', '_')
-    dt = datetime.fromtimestamp(sample_weather_data['dt'], tz=timezone.utc)
-    s3_key = f"bronze/openweathermap/city={city}/{dt.strftime('%Y-%m-%d_%H-%M')}UTC.json"
-    
     # Read the saved data
-    response = s3_client.get_object(Bucket=aws_config['bucket'], Key=s3_key)
+    response = s3_client.get_object(Bucket=aws_config['bucket'], Key=sample_monthly_data['s3_key'])
     saved_data = json.loads(response['Body'].read().decode('utf-8'))
     
     # Verify the saved data matches the original
-    assert saved_data == sample_weather_data
+    assert saved_data == sample_monthly_data
 
-def test_get_existing_s3_paths_real_bucket(aws_config, sample_weather_data, s3_client):
+def test_get_existing_s3_paths_real_bucket(aws_config, sample_monthly_data, s3_client):
     """Test getting existing S3 paths from real bucket"""
     # First, save some test data
-    test_data = sample_weather_data.copy()
+    test_data = sample_monthly_data.copy()
     test_data['city'] = f'TestCity_{uuid.uuid4().hex[:8]}'  # Unique city name
+    test_data['s3_key'] = f"bronze/openweathermap/city={test_data['city'].lower().replace(' ', '_')}/year={test_data['year']}/{test_data['month']:02d}.json"
     
     # Save to S3
     omw.save_to_s3([test_data], aws_config)
@@ -192,119 +232,16 @@ def test_get_existing_s3_paths_real_bucket(aws_config, sample_weather_data, s3_c
     
     # Get existing paths
     cities = [test_data['city']]
-    dates = [datetime.fromtimestamp(test_data['dt'])]
+    months = [(test_data['year'], test_data['month'])]
     
-    existing_paths = omw.get_existing_s3_paths(cities, dates, aws_config)
-    print(f"DEBUG: existing_paths = {existing_paths}")  # Debug print
+    existing_paths = omw.get_existing_s3_paths(cities, months, aws_config)
     
     # Verify the path exists
-    city = test_data['city'].lower().replace(' ', '_')
-    dt = datetime.fromtimestamp(test_data['dt'], tz=timezone.utc)
-    expected_key = f"bronze/openweathermap/city={city}/{dt.strftime('%Y-%m-%d_%H-%M')}UTC.json"
-    print(f"DEBUG: expected_key = {expected_key}")  # Debug print
-    
-    assert expected_key in existing_paths, f"Expected key {expected_key} not found in existing paths"
-
-def test_timezone_handling(api_key):
-    """Test that API calls are made with correct UTC timestamps based on city timezones"""
-    # Mock the API responses
-    with patch('requests.get') as mock_get, \
-         patch('src.bronze.owm_extract.get_existing_s3_paths') as mock_get_paths, \
-         patch('time.sleep') as mock_sleep:  # Mock sleep to speed up test
-        
-        # Mock responses for timezone info
-        def mock_get_side_effect(*args, **kwargs):
-            mock_response = MagicMock()
-            mock_response.raise_for_status.return_value = None
-            
-            url = args[0] if args else kwargs.get('url', '')
-            params = kwargs.get('params', {})
-            
-            if 'data/2.5/weather' in url:
-                city = params.get('q', '')
-                if city == 'London':
-                    mock_response.json.return_value = {
-                        'coord': {'lat': 51.5074, 'lon': -0.1278},
-                        'timezone': 0,  # UTC+0
-                        'name': 'London'
-                    }
-                elif city == 'New York':
-                    mock_response.json.return_value = {
-                        'coord': {'lat': 40.7128, 'lon': -74.0060},
-                        'timezone': -18000,  # UTC-5
-                        'name': 'New York'
-                    }
-                elif city == 'Tokyo':
-                    mock_response.json.return_value = {
-                        'coord': {'lat': 35.6762, 'lon': 139.6503},
-                        'timezone': 32400,  # UTC+9
-                        'name': 'Tokyo'
-                    }
-            elif 'data/3.0/onecall/timemachine' in url:
-                # Return a complete weather data response
-                mock_response.json.return_value = {
-                    'lat': params.get('lat'),
-                    'lon': params.get('lon'),
-                    'timezone': 'UTC',
-                    'timezone_offset': 0,
-                    'data': [{
-                        'dt': params.get('dt'),
-                        'temp': 20.0,  # Use float
-                        'feels_like': 18.0,  # Use float
-                        'pressure': 1015,
-                        'humidity': 65,
-                        'dew_point': 12.0,  # Use float
-                        'uvi': 5.0,  # Use float
-                        'clouds': 20,
-                        'visibility': 10000,
-                        'wind_speed': 5.0,  # Use float
-                        'wind_deg': 180,
-                        'wind_gust': 7.2,  # Add wind_gust as float
-                        'weather': [{
-                            'id': 800,
-                            'main': 'Clear',
-                            'description': 'clear sky',
-                            'icon': '01d'
-                        }]
-                    }]
-                }
-            return mock_response
-        
-        mock_get.side_effect = mock_get_side_effect
-        mock_get_paths.return_value = set()
-        
-        # Test cities with different timezones
-        cities = ["London", "New York", "Tokyo"]
-        test_date = datetime(2024, 3, 15)
-        
-        results, failures = omw.extract_historical_weather_for_cities(
-            city_list=cities,
-            api_key=api_key,
-            dates=[test_date]
-        )
-        
-        # Verify results
-        assert len(results) == len(cities)
-        assert len(failures) == 0
-        
-        # Verify timestamps correspond to 9:00 AM local time
-        for result in results:
-            city = result['city']
-            dt = datetime.fromtimestamp(result['dt'], tz=timezone.utc)
-            
-            if city == "London":
-                local_time = dt.astimezone(timezone.utc)
-            elif city == "New York":
-                local_time = dt.astimezone(timezone(timedelta(hours=-5)))
-            elif city == "Tokyo":
-                local_time = dt.astimezone(timezone(timedelta(hours=9)))
-            
-            assert local_time.hour == 9
-            assert local_time.minute == 0
+    assert test_data['s3_key'] in existing_paths, f"Expected key {test_data['s3_key']} not found in existing paths"
 
 # Validation Tests
 def test_pandera_validation_success(sample_weather_data):
-    """Test that valid data passes Pandera validation"""
+    """Test that valid data passes JSON schema validation"""
     assert omw.validate_bronze_data(sample_weather_data) is True
 
 def test_pandera_validation_failure_invalid_lat(sample_weather_data):
@@ -322,34 +259,27 @@ def test_pandera_validation_failure_invalid_lon(sample_weather_data):
 def test_pandera_validation_failure_invalid_humidity(sample_weather_data):
     """Test that invalid humidity fails validation"""
     invalid_data = sample_weather_data.copy()
-    invalid_data['humidity'] = 150  # Invalid humidity (>100)
+    invalid_data['humidity_afternoon'] = 150  # Invalid humidity (>100)
     assert omw.validate_bronze_data(invalid_data) is False
 
 def test_pandera_validation_failure_invalid_wind_deg(sample_weather_data):
     """Test that invalid wind direction fails validation"""
     invalid_data = sample_weather_data.copy()
-    invalid_data['wind_deg'] = 400  # Invalid wind direction (>360)
+    invalid_data['wind_max_direction'] = 400  # Invalid wind direction (>360)
     assert omw.validate_bronze_data(invalid_data) is False
 
 def test_pandera_validation_failure_missing_required(sample_weather_data):
     """Test that missing required fields fails validation"""
     invalid_data = sample_weather_data.copy()
-    del invalid_data['dt']  # Remove required field
+    del invalid_data['lat']  # Remove required field
     assert omw.validate_bronze_data(invalid_data) is False
 
-def test_pandera_validation_int32_conversion(sample_weather_data):
-    """Test that integer fields are properly converted to int32"""
+def test_pandera_validation_int_type(sample_weather_data):
+    """Test that integer fields as Python int are accepted"""
     data = sample_weather_data.copy()
-    # Convert to DataFrame and back to test int32 conversion
-    df = pd.DataFrame([data])
-    df = df.astype({
-        'dt': 'int32',
-        'pressure': 'int32',
-        'humidity': 'int32',
-        'clouds': 'int32',
-        'visibility': 'int32',
-        'wind_deg': 'int32',
-        'timezone_offset': 'int32'
-    })
-    converted_data = df.iloc[0].to_dict()
-    assert omw.validate_bronze_data(converted_data) is True
+    # Use Python int instead of numpy int32
+    data['cloud_cover_afternoon'] = int(data['cloud_cover_afternoon'])
+    data['humidity_afternoon'] = int(data['humidity_afternoon'])
+    data['pressure_afternoon'] = int(data['pressure_afternoon'])
+    data['wind_max_direction'] = int(data['wind_max_direction'])
+    assert omw.validate_bronze_data(data) is True
