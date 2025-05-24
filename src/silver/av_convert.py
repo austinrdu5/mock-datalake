@@ -11,8 +11,9 @@ import boto3
 import os
 import sys
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping
 import pandera as pa
+from pandera.errors import SchemaError
 from pandera import Column, Check
 import pandas as pd
 
@@ -25,19 +26,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize Spark session with S3 configuration
-def init_spark(aws_config: Dict[str, str] = None):
+def init_spark(aws_config: Mapping[str, str]) -> SparkSession:
     """Initialize the Spark session with proper S3 configurations"""
     
-    spark = SparkSession.builder \
-        .appName("StockDataProcessor") \
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262") \
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.hadoop.fs.s3a.access.key", aws_config['access_key']) \
-        .config("spark.hadoop.fs.s3a.secret.key", aws_config['secret_key']) \
-        .config("spark.hadoop.fs.s3a.endpoint", f"s3.{aws_config['region']}.amazonaws.com") \
-        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-        .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
-        .getOrCreate()
+    spark = (SparkSession.builder  
+        .appName("StockDataProcessor")  # type: ignore
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.access.key", aws_config['access_key'])
+        .config("spark.hadoop.fs.s3a.secret.key", aws_config['secret_key'])
+        .config("spark.hadoop.fs.s3a.endpoint", f"s3.{aws_config['region']}.amazonaws.com")
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        .getOrCreate())
     
     # Set log level to reduce verbosity
     spark.sparkContext.setLogLevel("WARN")
@@ -45,7 +46,7 @@ def init_spark(aws_config: Dict[str, str] = None):
     return spark
 
 # Function to get latest files for all tickers in bronze/alphavantage/
-def get_latest_files(aws_config: Dict[str, str], specific_tickers: Optional[list] = None) -> Dict[str, str]:
+def get_latest_files(aws_config: Mapping[str, str], specific_tickers: Optional[list] = None) -> Dict[str, str]:
     """
     Get the latest file path for each ticker in bronze/alphavantage/
     Args:
@@ -138,6 +139,10 @@ def process_stock_ticker(spark: SparkSession, ticker: str, latest_file_path: str
         
         # Check for null values in numeric columns
         null_counts = bronze_df.select([sum(col(c).isNull().cast("int")).alias(c) for c in numeric_columns]).first()
+        if null_counts is None:
+            logger.error(f"No data found for {ticker}")
+            return None
+            
         if any(null_counts[c] > 0 for c in numeric_columns):
             logger.error(f"Invalid numeric values found in {ticker}")
             return None
@@ -209,7 +214,7 @@ def process_stock_ticker(spark: SparkSession, ticker: str, latest_file_path: str
         try:
             silver_schema.validate(result_pd)
             logger.info(f"Pandera output validation passed for {ticker}")
-        except pa.errors.SchemaError as e:
+        except SchemaError as e:
             logger.error(f"Pandera output validation failed for {ticker}: {e}")
             return None
 
@@ -234,11 +239,11 @@ if __name__ == "__main__":
     try:
         # Get credentials based on test mode
         prefix = "TEST_" if args.use_test_bucket else ""
-        aws_config = {
-            'access_key': os.environ.get(f'{prefix}AWS_ACCESS_KEY'),
-            'secret_key': os.environ.get(f'{prefix}AWS_SECRET_KEY'),
-            'bucket_name': os.environ.get(f'{prefix}AWS_S3_BUCKET_NAME'),
-            'region': os.environ.get(f'{prefix}AWS_DEFAULT_REGION')
+        aws_config: Dict[str, str] = {
+            'access_key': os.environ.get(f'{prefix}AWS_ACCESS_KEY', ''),
+            'secret_key': os.environ.get(f'{prefix}AWS_SECRET_KEY', ''),
+            'bucket_name': os.environ.get(f'{prefix}AWS_S3_BUCKET_NAME', ''),
+            'region': os.environ.get(f'{prefix}AWS_DEFAULT_REGION', '')
         }
 
         # Log AWS configuration (last 4 chars of keys for security)

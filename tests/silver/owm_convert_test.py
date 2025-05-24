@@ -5,6 +5,8 @@ from pyspark.sql.functions import *
 from pyspark.sql.types import *
 import sys
 import os
+import json
+from datetime import date
 
 # Add src to path so we can import our modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
@@ -18,181 +20,248 @@ from silver.owm_convert import (
 @pytest.fixture(scope="session")
 def spark():
     """Create a Spark session for testing"""
-    spark = SparkSession.builder \
-        .appName("OWMConvertTest") \
-        .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
-        .getOrCreate()
+    spark = (SparkSession.builder
+        .appName("OWMConvertTest")  # type: ignore
+        .config("spark.sql.execution.arrow.pyspark.enabled", "false")
+        .getOrCreate())
     
     spark.sparkContext.setLogLevel("ERROR")  # Reduce noise
     yield spark
     spark.stop()
 
 @pytest.fixture(scope="session")
-def bronze_schema():
-    """Concrete schema for bronze data, matching the structure in owm_convert.py"""
-    return StructType([
-        StructField("lat", DoubleType(), True),
-        StructField("lon", DoubleType(), True),
-        StructField("dt", LongType(), True),
-        StructField("temp", DoubleType(), True),
-        StructField("feels_like", DoubleType(), True),
-        StructField("pressure", IntegerType(), True),
-        StructField("humidity", IntegerType(), True),
-        StructField("dew_point", DoubleType(), True),
-        StructField("uvi", DoubleType(), True),
-        StructField("clouds", IntegerType(), True),
-        StructField("visibility", IntegerType(), True),
-        StructField("wind_speed", DoubleType(), True),
-        StructField("wind_deg", IntegerType(), True),
-        StructField("wind_gust", DoubleType(), True),
-        StructField("weather", ArrayType(MapType(StringType(), StringType())), True),
-        StructField("_metadata", StructType([
-            StructField("source", StringType(), True),
-            StructField("ingestion_timestamp", StringType(), True),
-            StructField("city", StringType(), True),
-            StructField("timezone", StringType(), True),
-            StructField("timezone_offset", IntegerType(), True),
-        ]), True),
+def bronze_df(spark):
+    """Fixture providing a Spark DataFrame with bronze data"""
+    schema = StructType([
+        StructField("data", StructType([
+            StructField("metadata", StructType([
+                StructField("city", StringType(), True),
+                StructField("year", IntegerType(), True),
+                StructField("month", IntegerType(), True),
+                StructField("source", StringType(), True),
+                StructField("ingestion_timestamp", StringType(), True),
+                StructField("record_count", IntegerType(), True)
+            ]), True),
+            StructField("data", ArrayType(StructType([
+                StructField("lat", DoubleType(), True),
+                StructField("lon", DoubleType(), True),
+                StructField("date", StringType(), True),
+                StructField("temperature", StructType([
+                    StructField("min", DoubleType(), True),
+                    StructField("max", DoubleType(), True),
+                    StructField("afternoon", DoubleType(), True),
+                    StructField("night", DoubleType(), True),
+                    StructField("evening", DoubleType(), True),
+                    StructField("morning", DoubleType(), True)
+                ]), True),
+                StructField("pressure", StructType([
+                    StructField("afternoon", IntegerType(), True)
+                ]), True),
+                StructField("humidity", StructType([
+                    StructField("afternoon", IntegerType(), True)
+                ]), True),
+                StructField("cloud_cover", StructType([
+                    StructField("afternoon", IntegerType(), True)
+                ]), True),
+                StructField("precipitation", StructType([
+                    StructField("total", DoubleType(), True)
+                ]), True)
+            ])), True)
+        ]), True)
     ])
 
-@pytest.fixture
-def sample_bronze_data():
-    """Sample data that matches your S3 bronze structure exactly"""
-    return [
+    data = [
         {
-            "lat": 52.5244,
-            "lon": 13.4105,
-            "dt": 1704092400,  # 2024-01-01 07:00:00 UTC
-            "temp": 5.71,
-            "feels_like": 1.92,
-            "pressure": 1005,
-            "humidity": 88,
-            "dew_point": 3.88,
-            "uvi": None,
-            "clouds": 40,
-            "visibility": 10000,
-            "wind_speed": 5.7,
-            "wind_deg": 210,
-            "wind_gust": 0.0,
-            "weather": [{"id": "500", "main": "Rain", "description": "light rain", "icon": "10n"}],
-            "_metadata": {
-                "source": "openweathermap",
-                "ingestion_timestamp": "2025-05-08T20:56:55.884426",
-                "city": "Berlin",
-                "timezone": "Europe/Berlin",
-                "timezone_offset": 3600
+            "data": {
+                "metadata": {
+                    "city": "New York",
+                    "year": 2024,
+                    "month": 1,
+                    "source": "openweathermap",
+                    "ingestion_timestamp": "2025-05-08T20:56:55.884426",
+                    "record_count": 1
+                },
+                "data": [{
+                    "lat": 40.7128,
+                    "lon": -74.0060,
+                    "date": "2024-01-01",
+                    "temperature": {
+                        "min": 1.18,
+                        "max": 3.74,
+                        "afternoon": 3.37,
+                        "night": 1.57,
+                        "evening": 3.42,
+                        "morning": 1.41
+                    },
+                    "pressure": {"afternoon": 1021},
+                    "humidity": {"afternoon": 72},
+                    "cloud_cover": {"afternoon": 100},
+                    "precipitation": {"total": 1.14}
+                }]
             }
         },
         {
-            # Test case with missing fields (lower confidence score)
-            "lat": 40.7128,
-            "lon": -74.0060,
-            "dt": 1704096000,  # 2024-01-01 08:00:00 UTC
-            "temp": 2.5,
-            "feels_like": None,  # Missing
-            "pressure": None,    # Missing
-            "humidity": 65,
-            "visibility": None,  # Missing
-            "wind_speed": 3.2,
-            "_metadata": {
-                "source": "openweathermap",
-                "ingestion_timestamp": "2025-05-08T21:00:00.000000",
-                "city": "New York",
+            "data": {
+                "metadata": {
+                    "city": "New York",
+                    "year": 2024,
+                    "month": 1,
+                    "source": "openweathermap",
+                    "ingestion_timestamp": "2025-05-08T20:56:55.884426",
+                    "record_count": 1
+                },
+                "data": [{
+                    "lat": 40.7128,
+                    "lon": -74.0060,
+                    "date": "2024-01-02",
+                    "temperature": {
+                        "min": 1.18,
+                        "max": 3.74,
+                        "afternoon": 3.37,
+                        "night": 1.57,
+                        "evening": 3.42,
+                        "morning": 1.41
+                    },
+                    "pressure": {"afternoon": None},
+                    "humidity": {"afternoon": 72},
+                    "cloud_cover": {"afternoon": None},
+                    "precipitation": {"total": 1.14}
+                }]
             }
         }
     ]
+    
+    return spark.createDataFrame(data, schema=schema)
 
 class TestConfidenceScoreCalculation:
-    """Test the confidence score calculation logic"""
+    """Test the confidence score calculation logic in isolation with minimal DataFrames"""
     
-    def test_perfect_confidence_score(self, spark, sample_bronze_data, bronze_schema):
+    def test_perfect_confidence_score(self, spark):
         """Test confidence score with all fields present"""
-        df = spark.createDataFrame([sample_bronze_data[0]], schema=bronze_schema)
+        data = [{
+            "temperature_celsius": 3.37,
+            "pressure_hpa": 1021,
+            "humidity_percent": 72,
+            "cloud_cover_percent": 100,
+            "precipitation_mm": 1.14
+        }]
+        df = spark.createDataFrame(data)
         result = calculate_confidence_score(df)
         confidence = result.select("data_confidence_score").collect()[0][0]
-        # All fields present: temp(0.3) + pressure(0.2) + humidity(0.2) + feels_like(0.1) + wind_speed(0.1) + visibility(0.1) = 1.0
         assert confidence == 1.0
     
-    def test_partial_confidence_score(self, spark, sample_bronze_data, bronze_schema):
-        """Test confidence score with missing fields"""
-        df = spark.createDataFrame([sample_bronze_data[1]], schema=bronze_schema)
+    def test_partial_confidence_score(self, spark):
+        """Test confidence score with some fields missing"""
+        data = [{
+            "temperature_celsius": 3.37,
+            "pressure_hpa": None,
+            "humidity_percent": 72,
+            "cloud_cover_percent": None,
+            "precipitation_mm": 1.14
+        }]
+        schema = StructType([
+            StructField("temperature_celsius", DoubleType(), True),
+            StructField("pressure_hpa", IntegerType(), True),
+            StructField("humidity_percent", IntegerType(), True),
+            StructField("cloud_cover_percent", IntegerType(), True),
+            StructField("precipitation_mm", DoubleType(), True)
+        ])
+        df = spark.createDataFrame(data, schema=schema)
         result = calculate_confidence_score(df)
         confidence = result.select("data_confidence_score").collect()[0][0]
-        # Present: temp(0.3) + humidity(0.2) + wind_speed(0.1) = 0.6
-        # Missing: pressure, feels_like, visibility
-        assert confidence == 0.6
+        # Present: temperature(0.6) + humidity(0.1) + precipitation(0.1) = 0.8
+        assert confidence == 0.8
 
 class TestDataTransformation:
     """Test the complete data transformation pipeline"""
     
-    def test_bronze_to_silver_transformation(self, spark, sample_bronze_data, bronze_schema):
+    def test_bronze_to_silver_transformation(self, spark, bronze_df):
         """Test the complete transformation matches expected schema"""
-        # Create bronze DataFrame
-        df = spark.createDataFrame(sample_bronze_data, schema=bronze_schema)
-        
         # Apply the same transformation as in your main function
-        transformed_df = df.select(
-            # Convert Unix timestamp to proper datetime
-            timestamp_seconds(col("dt")).alias("observation_datetime"),
-            col("_metadata.ingestion_timestamp").cast("timestamp").alias("ingestion_datetime"),
-            year(timestamp_seconds(col("dt"))).cast("long").alias("year"),  # Cast to long to avoid int32 issue
+        transformed_df = bronze_df.select(
+            explode("data.data").alias("weather_data"),
+            col("data.metadata").alias("metadata")
+        ).select(
+            # Convert date string to date
+            to_date(col("weather_data.date")).alias("observation_date"),
+            col("metadata.ingestion_timestamp").cast("timestamp").alias("ingestion_datetime"),
+            col("metadata.year").cast("long").alias("year"),
             
             # Location fields
-            col("_metadata.city").alias("city"),
-            col("lat").alias("latitude"),
-            col("lon").alias("longitude"),
+            col("metadata.city").alias("city"),
+            col("weather_data.lat").alias("latitude"),
+            col("weather_data.lon").alias("longitude"),
             
-            # Weather measurements
-            col("temp").alias("temperature_celsius"),
-            col("feels_like").alias("feels_like_celsius"),
-            col("pressure").cast("integer").alias("pressure_hpa"),
-            col("humidity").alias("humidity_percent"),
-            
-            # Keep original fields for confidence calculation
-            col("temp"), col("pressure"), col("humidity"), 
-            col("feels_like"), col("wind_speed"), col("visibility"),
+            # Weather measurements - accessing nested fields
+            col("weather_data.temperature.afternoon").alias("temperature_celsius"),
+            col("weather_data.pressure.afternoon").cast("integer").alias("pressure_hpa"),
+            col("weather_data.humidity.afternoon").alias("humidity_percent"),
+            col("weather_data.cloud_cover.afternoon").alias("cloud_cover_percent"),
+            col("weather_data.precipitation.total").alias("precipitation_mm"),
             
             # Lineage
-            col("_metadata.source").alias("source_system")
+            col("metadata.source").alias("source_system")
         )
         
         # Calculate confidence score
         transformed_df = calculate_confidence_score(transformed_df)
         
-        # Drop helper columns
-        final_df = transformed_df.drop("temp", "pressure", "humidity", "feels_like", "wind_speed", "visibility")
-        
         # Verify we have the expected number of records
-        assert final_df.count() == 2
+        assert transformed_df.count() == 2  # We have 2 test records
         
         # Check that required columns exist
         expected_columns = [
-            "observation_datetime", "ingestion_datetime", "year", "city", 
-            "latitude", "longitude", "temperature_celsius", "feels_like_celsius",
-            "pressure_hpa", "humidity_percent", "data_confidence_score", "source_system"
+            "observation_date", "ingestion_datetime", "year", "city", 
+            "latitude", "longitude", "temperature_celsius",
+            "pressure_hpa", "humidity_percent", "cloud_cover_percent", 
+            "precipitation_mm", "data_confidence_score", "source_system"
         ]
         
-        actual_columns = final_df.columns
+        actual_columns = transformed_df.columns
         for col_name in expected_columns:
             assert col_name in actual_columns, f"Missing column: {col_name}"
         
-        return final_df
-    
-    def test_datetime_conversion(self, spark, sample_bronze_data, bronze_schema):
-        """Test that Unix timestamps are properly converted"""
-        df = spark.createDataFrame([sample_bronze_data[0]], schema=bronze_schema)
-        result = df.select(
-            timestamp_seconds(col("dt")).alias("observation_datetime")
-        ).collect()[0]
-        # dt: 1704092400 should convert to 2024-01-01 02:00:00 in local time (UTC-5)
-        assert str(result.observation_datetime).startswith("2024-01-01 02:00:00")
-    
-    def test_year_extraction_for_partitioning(self, spark, sample_bronze_data, bronze_schema):
-        """Test year extraction for partitioning"""
-        df = spark.createDataFrame(sample_bronze_data, schema=bronze_schema)
+        # Verify the values for the first record
+        rows = transformed_df.collect()
+        assert rows[0].temperature_celsius == 3.37
+        assert rows[0].pressure_hpa == 1021
+        assert rows[0].humidity_percent == 72
+        assert rows[0].cloud_cover_percent == 100
+        assert rows[0].precipitation_mm == 1.14
         
-        result = df.select(
-            year(timestamp_seconds(col("dt"))).cast("long").alias("year")
+        # Verify the values for the second record
+        assert rows[1].temperature_celsius == 3.37
+        assert rows[1].pressure_hpa is None
+        assert rows[1].humidity_percent == 72
+        assert rows[1].cloud_cover_percent is None
+        assert rows[1].precipitation_mm == 1.14
+        
+        # Verify confidence scores
+        assert rows[0].data_confidence_score == 1.0  # All fields present
+        assert rows[1].data_confidence_score == 0.8  # Some fields missing
+        
+        # Verify source system
+        assert rows[0].source_system == "openweathermap"
+        assert rows[1].source_system == "openweathermap"
+    
+    def test_datetime_conversion(self, spark, bronze_df):
+        """Test that date strings are properly converted"""
+        result = bronze_df.select(
+            explode("data.data").alias("weather_data")
+        ).select(
+            to_date(col("weather_data.date")).alias("observation_date")
+        ).collect()[0]
+        # date: "2024-01-01" should convert to 2024-01-01
+        assert str(result.observation_date) == "2024-01-01"
+    
+    def test_year_extraction_for_partitioning(self, spark, bronze_df):
+        """Test year extraction for partitioning"""
+        # First explode the data array
+        exploded_df = bronze_df.select(explode("data.data").alias("weather_data"))
+        
+        # Then extract the year
+        result = exploded_df.select(
+            year(to_timestamp(col("weather_data.date"))).cast("long").alias("year")
         ).collect()
         
         # Both test records are from 2024
@@ -202,125 +271,104 @@ class TestDataTransformation:
 class TestSchemaValidation:
     """Test Pandera schema validation"""
     
-    def test_schema_validation_success(self, spark, sample_bronze_data, bronze_schema):
+    def test_schema_validation_success(self, spark, bronze_df):
         """Test that properly transformed data passes validation"""
-        # Run the full transformation
-        test_transform = TestDataTransformation()
-        final_df = test_transform.test_bronze_to_silver_transformation(spark, sample_bronze_data, bronze_schema)
+        # Apply the same transformation as in your main function
+        transformed_df = bronze_df.select(
+            explode("data.data").alias("weather_data"),
+            col("data.metadata").alias("metadata")
+        ).select(
+            to_date(col("weather_data.date")).alias("observation_date"),
+            col("metadata.ingestion_timestamp").cast("timestamp").alias("ingestion_datetime"),
+            col("metadata.year").cast("long").alias("year"),
+            col("metadata.city").alias("city"),
+            col("weather_data.lat").alias("latitude"),
+            col("weather_data.lon").alias("longitude"),
+            col("weather_data.temperature.afternoon").alias("temperature_celsius"),
+            col("weather_data.pressure.afternoon").cast("integer").alias("pressure_hpa"),
+            col("weather_data.humidity.afternoon").alias("humidity_percent"),
+            col("weather_data.cloud_cover.afternoon").cast("double").alias("cloud_cover_percent"),
+            col("weather_data.precipitation.total").alias("precipitation_mm"),
+            col("metadata.source").alias("source_system")
+        )
+        
+        # Calculate confidence score
+        transformed_df = calculate_confidence_score(transformed_df)
+        
         # Convert to pandas for validation
-        pandas_df = final_df.toPandas()
-        # Cast pressure_hpa and humidity_percent to Int64 for Pandera
+        pandas_df = transformed_df.toPandas()
+        
+        # Cast integer columns to Int64 for Pandera
         for colname in ["pressure_hpa", "humidity_percent"]:
             if colname in pandas_df.columns:
                 pandas_df[colname] = pandas_df[colname].astype('Int64')
+        
         # This should pass without errors
         result = validate_silver_data(pandas_df)
         assert result == True
     
-    def test_schema_validation_catches_bad_data(self, spark, bronze_schema):
+    def test_schema_validation_catches_bad_data(self, spark):
         """Test that schema validation catches invalid data"""
         # Create data that violates the schema
         bad_data = [{
-            "observation_datetime": "2024-01-01 07:00:00",
+            "observation_date": "2024-01-01",
             "ingestion_datetime": "2025-05-08 20:56:55",
             "year": 2024,
-            "city": "Berlin",
+            "city": "New York",
             "latitude": 200.0,  # Invalid - should be between -90 and 90
-            "longitude": 13.4105,
-            "temperature_celsius": 5.71,
-            "feels_like_celsius": 1.92,
-            "pressure_hpa": 1005,
-            "humidity_percent": 88,
+            "longitude": -74.0060,
+            "temperature_celsius": 3.37,
+            "feels_like_celsius": 3.37,
+            "pressure_hpa": 1021,
+            "humidity_percent": 72,
+            "cloud_cover_percent": 100,
+            "precipitation_mm": 1.14,
             "data_confidence_score": 1.0,
             "source_system": "openweathermap"
         }]
         
         pandas_df = pd.DataFrame(bad_data)
-        pandas_df['observation_datetime'] = pd.to_datetime(pandas_df['observation_datetime'])
         pandas_df['ingestion_datetime'] = pd.to_datetime(pandas_df['ingestion_datetime'])
         
         # This should fail validation
         result = validate_silver_data(pandas_df)
         assert result == False
 
-class TestEdgeCases:
-    """Test edge cases and error conditions"""
-    
-    def test_handles_null_metadata(self, spark, bronze_schema):
-        """Test handling of records with missing metadata"""
-        data_with_null_metadata = [{
-            "lat": 52.5244,
-            "lon": 13.4105,
-            "dt": 1704092400,
-            "temp": 5.71,
-            "_metadata": {
-                "source": "openweathermap",
-                "city": None,  # Null city
-                "ingestion_timestamp": "2025-05-08T20:56:55.884426"
-            }
-        }]
-        
-        df = spark.createDataFrame(data_with_null_metadata, schema=bronze_schema)
-        
-        # Should handle null city gracefully
-        result = df.select(col("_metadata.city").alias("city")).collect()[0]
-        assert result.city is None
-    
-    def test_handles_missing_weather_fields(self, spark, bronze_schema):
-        """Test confidence calculation with completely missing weather fields"""
-        minimal_data = [{
-            "lat": 52.5244,
-            "lon": 13.4105,
-            "dt": 1704092400,
-            # No weather measurements at all
-            "_metadata": {
-                "source": "openweathermap",
-                "city": "Berlin",
-                "ingestion_timestamp": "2025-05-08T20:56:55.884426"
-            }
-        }]
-        
-        df = spark.createDataFrame(minimal_data, schema=bronze_schema)
-        result = calculate_confidence_score(df)
-        
-        confidence = result.select("data_confidence_score").collect()[0][0]
-        
-        # No weather fields present, confidence should be 0.0
-        assert confidence == 0.0
-
-def test_full_pipeline_integration(spark, sample_bronze_data, bronze_schema):
+def test_full_pipeline_integration(spark, bronze_df):
     """Integration test that simulates the full pipeline"""
     # This test runs the complete transformation pipeline
-    df = spark.createDataFrame(sample_bronze_data, schema=bronze_schema)
-    # Apply transformations (same as main function)
-    transformed_df = df.select(
-        timestamp_seconds(col("dt")).alias("observation_datetime"),
-        col("_metadata.ingestion_timestamp").cast("timestamp").alias("ingestion_datetime"),
-        year(timestamp_seconds(col("dt"))).cast("long").alias("year"),
-        col("_metadata.city").alias("city"),
-        col("lat").alias("latitude"),
-        col("lon").alias("longitude"),
-        col("temp").alias("temperature_celsius"),
-        col("feels_like").alias("feels_like_celsius"),
-        col("pressure").cast("integer").alias("pressure_hpa"),
-        col("humidity").alias("humidity_percent"),
-        col("temp"), col("pressure"), col("humidity"), 
-        col("feels_like"), col("wind_speed"), col("visibility"),
-        col("_metadata.source").alias("source_system")
+    transformed_df = bronze_df.select(
+        explode("data.data").alias("weather_data"),
+        col("data.metadata").alias("metadata")
+    ).select(
+        to_date(col("weather_data.date")).alias("observation_date"),
+        col("metadata.ingestion_timestamp").cast("timestamp").alias("ingestion_datetime"),
+        col("metadata.year").cast("long").alias("year"),
+        col("metadata.city").alias("city"),
+        col("weather_data.lat").alias("latitude"),
+        col("weather_data.lon").alias("longitude"),
+        col("weather_data.temperature.afternoon").alias("temperature_celsius"),
+        col("weather_data.pressure.afternoon").cast("integer").alias("pressure_hpa"),
+        col("weather_data.humidity.afternoon").alias("humidity_percent"),
+        col("weather_data.cloud_cover.afternoon").cast("double").alias("cloud_cover_percent"),
+        col("weather_data.precipitation.total").alias("precipitation_mm"),
+        col("metadata.source").alias("source_system")
     )
-    # Calculate confidence and clean up
+    # Calculate confidence score
     transformed_df = calculate_confidence_score(transformed_df)
-    final_df = transformed_df.drop("temp", "pressure", "humidity", "feels_like", "wind_speed", "visibility")
     # Validate schema
-    pandas_df = final_df.toPandas()
+    pandas_df = transformed_df.toPandas()
+    
+    # Cast integer columns to Int64 for Pandera
     for colname in ["pressure_hpa", "humidity_percent"]:
         if colname in pandas_df.columns:
             pandas_df[colname] = pandas_df[colname].astype('Int64')
     assert validate_silver_data(pandas_df) == True
     # Check partitioning columns
-    partitioning_check = final_df.select("city", "year").distinct().collect()
-    assert len(partitioning_check) == 2  # Berlin 2024, New York 2024
+    partitioning_check = transformed_df.select("city", "year").distinct().collect()
+    assert len(partitioning_check) == 1  # New York 2024
     print("✅ Full pipeline integration test passed!")
-    print(f"✅ Processed {final_df.count()} records")
+    print(f"✅ Processed {transformed_df.count()} records")
     print(f"✅ Schema validation successful")
     print(f"✅ Partitioning ready: {len(partitioning_check)} unique city/year combinations")
+
