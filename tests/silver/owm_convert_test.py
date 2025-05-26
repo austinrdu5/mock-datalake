@@ -8,10 +8,7 @@ import os
 import json
 from datetime import date
 
-# Add src to path so we can import our modules
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
-
-from silver.owm_convert import (
+from src.silver.owm_convert import (
     calculate_confidence_score, 
     OpenWeatherMapSilverSchema,
     validate_silver_data

@@ -317,10 +317,6 @@ if __name__ == "__main__":
             exit(1)
         
         logger.info("=== Transformation Complete ===")
-        logger.info(f"✅ Successfully processed ecommerce data to Delta Lake")
-        logger.info(f"✅ Data partitioned by year_month and event_type")
-        logger.info(f"✅ Time travel and ACID transactions enabled")
-        logger.info(f"✅ Ready for downstream analytics and temporal queries")
         
     except Exception as e:
         logger.error(f"Error in main processing: {e}")

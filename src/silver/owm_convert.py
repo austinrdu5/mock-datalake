@@ -44,10 +44,15 @@ class OpenWeatherMapSilverSchema(pa.DataFrameModel):
         strict = True
 
 def init_spark(aws_config: Dict[str, str]) -> SparkSession:
-    """Initialize the Spark session with proper S3 configurations"""
+    """Initialize the Spark session with Delta Lake and S3 configurations"""
     
     builder = (SparkSession.builder
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262") # type: ignore
+        .config("spark.jars.packages",  # type: ignore
+                "org.apache.hadoop:hadoop-aws:3.3.4,"
+                "com.amazonaws:aws-java-sdk-bundle:1.12.262,"
+                "io.delta:delta-spark_2.12:3.3.1")  # Delta Lake package
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")  # Delta SQL support
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")  # Delta catalog
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.access.key", aws_config['access_key'])
         .config("spark.hadoop.fs.s3a.secret.key", aws_config['secret_key'])
@@ -57,6 +62,8 @@ def init_spark(aws_config: Dict[str, str]) -> SparkSession:
     
     spark = builder.appName("WeatherDataProcessor").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    
+    logger.info("Initialized Spark session with Delta Lake support")
     return spark
 
 def calculate_confidence_score(df):
@@ -98,7 +105,7 @@ def validate_silver_data(df_pandas):
         return False
     
 def transform_owm_bronze_to_silver(spark, input_paths, output_path):
-    """Transform OpenWeatherMap data from bronze to silver layer"""
+    """Transform OpenWeatherMap data from bronze to silver layer using Delta Lake"""
     
     logger.info(f"Starting transformation from {input_paths} to {output_path}")
     
@@ -147,15 +154,20 @@ def transform_owm_bronze_to_silver(spark, input_paths, output_path):
         logger.error("Silver data validation failed. Aborting transformation.")
         return None
     
-    # Write to silver layer partitioned by city and year
-    final_df.write \
-        .mode("overwrite") \
-        .partitionBy("city", "year") \
-        .parquet(output_path)
-    
-    logger.info(f"Successfully wrote {final_df.count()} records to {output_path}")
-    
-    return final_df
+    # Write to Delta Lake with partitioning
+    try:
+        (final_df.write
+         .format("delta")
+         .mode("append")  # Append new data
+         .partitionBy("city", "year")  # Partition by city and year for efficient querying
+         .save(output_path))
+        
+        logger.info(f"Successfully wrote {final_df.count()} records to Delta Lake at {output_path}")
+        return final_df
+        
+    except Exception as e:
+        logger.error(f"Failed to write to Delta Lake: {e}")
+        return None
 
 if __name__ == "__main__":
     import argparse
@@ -163,7 +175,7 @@ if __name__ == "__main__":
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Transform OpenWeatherMap data from bronze to silver layer')
     parser.add_argument('--cities', nargs='+', default=['London'],
-                      help='List of cities to process (default: London)')
+                      help='List of cities to process (default: London). Use "all" to process all available cities.')
     parser.add_argument('--test-mode', action='store_true',
                       help='Run in test mode using local paths')
     args = parser.parse_args()
@@ -180,8 +192,15 @@ if __name__ == "__main__":
     spark = init_spark(aws_config)
 
     # Construct city-specific paths for reading
-    cities = [city.lower().replace(' ', '_') for city in args.cities]
-    bronze_paths = [f"s3a://mock-datalake1/bronze/openweathermap/city={city}/year=2024/" for city in cities]
+    if "all" in args.cities:
+        # If "all" is specified, use a wildcard pattern to match all cities and years
+        bronze_paths = ["s3a://mock-datalake1/bronze/openweathermap/city=*/year=*/"]
+        logger.info("Processing all available cities and years")
+    else:
+        # Process specific cities with all years
+        cities = [city.lower().replace(' ', '_') for city in args.cities]
+        bronze_paths = [f"s3a://mock-datalake1/bronze/openweathermap/city={city}/year=*/" for city in cities]
+        logger.info(f"Processing cities {cities} for all available years")
 
     if args.test_mode:
         silver_path = "s3a://mock-datalake1-test/silver/openweathermap/"
@@ -189,7 +208,6 @@ if __name__ == "__main__":
     else:
         silver_path = "s3a://mock-datalake1/silver/openweathermap/"
 
-    
     logger.info(f"Reading data from paths: {bronze_paths}")
     
     # Transform data

@@ -12,8 +12,7 @@ from src.silver.ecommerce_convert import (
     calculate_confidence_score_ecommerce,
     transform_ecommerce_bronze_to_silver,   
     write_to_delta_lake,
-    validate_silver_data,
-    EcommerceSilverSchema
+    validate_silver_data
 )
 
 # Set up logging for tests
