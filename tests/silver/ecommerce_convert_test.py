@@ -1,15 +1,10 @@
 import pytest
 import pandas as pd
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import col
 import boto3
 import os
-import tempfile
-import shutil
-from datetime import datetime
 import uuid
 import logging
-from unittest.mock import patch, MagicMock
 
 from src.silver.ecommerce_convert import (
     init_spark_with_delta, 
