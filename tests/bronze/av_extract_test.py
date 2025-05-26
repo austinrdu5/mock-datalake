@@ -246,7 +246,6 @@ def test_process_symbol_with_existing_data(test_timestamp):
     assert process_symbol('TEST', 'TIME_SERIES_DAILY', test_timestamp, TEST_AWS_CONFIG, 'demo', force_refresh=True), "Should return True with force refresh"
 
 @pytest.mark.dependency(depends=["fetch_full_data"])
-@pytest.mark.integration
 def test_real_s3_integration(test_timestamp, test_data_full):
     """Integration test using real S3 bucket and Alpha Vantage demo key"""
     # Format timestamp to match new naming scheme
@@ -284,7 +283,6 @@ def test_real_s3_integration(test_timestamp, test_data_full):
         print(f"Warning: Failed to clean up S3: {str(e)}")
 
 @pytest.mark.dependency(depends=["fetch_full_data"])
-@pytest.mark.integration
 def test_validation_with_demo_key(test_data_full):
     """Test that data from Alpha Vantage demo key passes Pandera validation"""
     # Validate the data
