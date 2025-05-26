@@ -1,14 +1,12 @@
-from typing import Dict, Optional, Any
+from typing import Dict
 import pandas as pd
 import pandera.pandas as pa
 from pandera.errors import SchemaError
-from pandera.typing import DataFrame, Series
+from pandera.typing import Series
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
-from datetime import datetime, date
-import boto3
-import json
+from pyspark.sql.functions import (
+    col, lit, to_date, explode, lower, regexp_replace, when, round
+)
 import logging
 import os
 import argparse

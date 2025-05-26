@@ -11,10 +11,10 @@ import boto3
 import os
 import sys
 import logging
-from typing import Optional, Dict, Any, Mapping
+from typing import Optional, Dict, Mapping
 import pandera as pa
 from pandera.errors import SchemaError
-from pandera import Column, Check
+from pandera import Column
 import pandas as pd
 
 # Set up logging
