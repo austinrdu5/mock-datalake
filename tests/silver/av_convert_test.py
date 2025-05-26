@@ -4,6 +4,7 @@ import boto3
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
+from pyspark.sql.types import Row
 from src.silver.av_convert import init_spark, process_stock_ticker, get_latest_files
 
 def validate_test_credentials():
@@ -247,6 +248,7 @@ def test_process_stock_ticker(spark_session, setup_test_data):
     
     # Verify data values
     row = result_df.first()
+    assert row is not None, "Expected non-None row from DataFrame"
     assert row["ticker"] == test_ticker
     assert row["open_price"] == 100.0
     assert row["high_price"] == 105.0

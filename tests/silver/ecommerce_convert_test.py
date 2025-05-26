@@ -2,7 +2,6 @@ import pytest
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit
-from pyspark.sql.types import *
 import boto3
 import os
 import tempfile
@@ -12,14 +11,11 @@ import uuid
 import logging
 from unittest.mock import patch, MagicMock
 
-# Import functions to test
-import sys
-sys.path.append('../silver')
-from ecommerce_convert import (
+from src.silver.ecommerce_convert import (
     init_spark_with_delta, 
     parse_category_hierarchy,
     calculate_confidence_score_ecommerce,
-    transform_ecommerce_bronze_to_silver,
+    transform_ecommerce_bronze_to_silver,   
     write_to_delta_lake,
     validate_silver_data,
     EcommerceSilverSchema
@@ -115,7 +111,9 @@ class TestEcommerceConverter:
     def test_spark_delta_initialization(self):
         """Test that Spark session initializes with Delta Lake support"""
         assert self.spark is not None
-        assert "delta" in [pkg for pkg in self.spark.sparkContext.getConf().get("spark.jars.packages").split(",")]
+        packages = self.spark.sparkContext.getConf().get("spark.jars.packages")
+        assert packages is not None, "spark.jars.packages should be configured"
+        assert "delta" in packages, "Delta Lake package should be configured"
         logger.info("✅ Spark with Delta Lake initialized successfully")
     
     def test_category_hierarchy_parsing(self):
@@ -151,9 +149,9 @@ class TestEcommerceConverter:
         
         for i, (orig, exp_l1, exp_l2, exp_l3) in enumerate(expected):
             row = result_df[i]
-            assert row.level_1 == exp_l1, f"Level 1 mismatch for {orig}"
-            assert row.level_2 == exp_l2, f"Level 2 mismatch for {orig}"
-            assert row.level_3 == exp_l3, f"Level 3 mismatch for {orig}"
+            assert row.level_1 == exp_l1, f"Level 1 mismatch for {orig}: expected {exp_l1}, got {row.level_1}"
+            assert row.level_2 == exp_l2, f"Level 2 mismatch for {orig}: expected {exp_l2}, got {row.level_2}"
+            assert row.level_3 == exp_l3, f"Level 3 mismatch for {orig}: expected {exp_l3}, got {row.level_3}"
         
         logger.info("✅ Category hierarchy parsing works correctly")
     
@@ -170,6 +168,16 @@ class TestEcommerceConverter:
             (None, None)                   # Missing both: 0.0
         ]
         
+        test_cases = [
+            "Both category and brand present",
+            "Category present, empty brand",
+            "Category present, null brand",
+            "Empty category, brand present",
+            "Null category, brand present",
+            "Empty category and brand",
+            "Null category and brand"
+        ]
+        
         df = self.spark.createDataFrame(test_data, ["category_level_1", "brand"])
         
         # Apply confidence score calculation
@@ -178,8 +186,8 @@ class TestEcommerceConverter:
         
         expected_scores = [1.0, 0.6, 0.6, 0.4, 0.4, 0.0, 0.0]
         
-        for i, (expected, actual) in enumerate(zip(expected_scores, scores)):
-            assert abs(actual - expected) < 0.01, f"Score mismatch for row {i}: expected {expected}, got {actual}"
+        for i, (expected, actual, case) in enumerate(zip(expected_scores, scores, test_cases)):
+            assert abs(actual - expected) < 0.01, f"Score mismatch for case '{case}': expected {expected}, got {actual}"
         
         logger.info("✅ Confidence score calculation works correctly")
     
@@ -241,12 +249,29 @@ class TestEcommerceConverter:
             
             # Verify required columns exist
             expected_columns = [
-                'event_time', 'event_type', 'product_id', 'year_month', 
-                'category_level_1', 'data_confidence_score'
+                # Event identification
+                'event_time', 'event_type',
+                
+                # Product information
+                'product_id', 'category_id', 'category_level_1', 'category_level_2', 
+                'category_level_3', 'brand', 'price',
+                
+                # User information
+                'user_id', 'user_session',
+                
+                # Temporal and partitioning fields
+                'year_month', 'processing_timestamp', 'effective_from', 'effective_to',
+                
+                # Data quality and lineage
+                'data_confidence_score', 'source_system', 'source_file', 'batch_id', 'record_id'
             ]
             actual_columns = silver_df.columns
             for col_name in expected_columns:
                 assert col_name in actual_columns, f"Missing column: {col_name}"
+            
+            # Convert to pandas for schema validation
+            pandas_df = silver_df.toPandas()
+            assert validate_silver_data(pandas_df), "Data failed schema validation"
             
             # Verify confidence scores
             scores = silver_df.select("data_confidence_score").collect()
@@ -282,6 +307,8 @@ class TestEcommerceConverter:
                 self.test_silver_path
             )
             
+            assert silver_df is not None, "Transformation should not return None"
+            
             # Write to Delta Lake
             success = write_to_delta_lake(silver_df, self.test_silver_path)
             assert success == True, "Delta Lake write should succeed"
@@ -302,7 +329,7 @@ class TestEcommerceConverter:
             # Check if we can query with Delta syntax
             read_df.createOrReplaceTempView("ecommerce_events")
             result = self.spark.sql("SELECT COUNT(*) as count FROM ecommerce_events").collect()
-            assert result[0].count == original_count
+            assert result[0]["count"] == original_count
             
             logger.info("✅ Delta Lake write and read operations work correctly")
             
@@ -312,16 +339,22 @@ class TestEcommerceConverter:
     
     def test_error_handling(self):
         """Test error handling for edge cases"""
+        # Test with non-existent file in our test bucket
+        non_existent_path = f"s3a://{self.aws_config['bucket_name']}/test/nonexistent/file.csv"
+        
         # Test with non-existent file
-        result = transform_ecommerce_bronze_to_silver(
-            self.spark,
-            "s3a://nonexistent/path/file.csv",
-            self.test_silver_path
-        )
-        # Should handle gracefully (might return None or raise exception)
-        # The exact behavior depends on your error handling implementation
+        with pytest.raises(Exception) as exc_info:
+            transform_ecommerce_bronze_to_silver(
+                self.spark,
+                non_existent_path,
+                self.test_silver_path
+            )
+        
+        # Verify the error message contains the expected text
+        assert "Path does not exist" in str(exc_info.value)
         
         logger.info("✅ Error handling test completed")
+
 
 if __name__ == "__main__":
     # Run tests
