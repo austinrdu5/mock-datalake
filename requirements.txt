@@ -1,4 +1,4 @@
-pyspark>=3.5.0
+pyspark>=3.3.0
 boto3>=1.34.0
 python-dotenv==0.20.0
 requests>=2.31.0
@@ -8,5 +8,8 @@ moto==4.2.13  # For mocking AWS services in tests
 pyarrow>=20.0.0
 esdbclient>=0.1.0
 pytest>=7.0.0
-pandas>=2.0.0
+pandas>=1.5.0
 pandera>=0.17.0  # Required for schema validation in tests
+delta-spark>=3.0.0  # Required for Delta Lake support
+great-expectations>=0.18.0
+numpy>=1.24.0
